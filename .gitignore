@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments / conda
+.env
+.venv
+env/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data files (live on external drive, not in repo)
+*.nc
+*.zarr/
+*.h5
+*.hdf5
+*.tif
+*.tiff
+*.geotiff
+
+# IDE / editor
+.vscode/
+*.code-workspace
+.idea/
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Claude Code local memory
+.claude/
+
+# Local notes / scratch
+_TO_DO.txt
+*.tmp

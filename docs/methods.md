@@ -1,0 +1,389 @@
+# VI Phenology Dashboard — Scientific & Technical Methods
+
+## 1. Data Sources
+
+### 1.1 Input Datacubes
+
+| Parameter | Value |
+|---|---|
+| Campaign | BioSCape (Biodiversity Survey of the Cape), South Africa |
+| Instrument | NASA G-V (N95ND) HLS / HLS-2 satellite imagery |
+| Spatial footprint | LVIS flight box regions (G5_1 through G5_25, 18 regions used) |
+| Temporal coverage | January 2016 – June 2019 (~3.5 years) |
+| Temporal resolution | Irregular (1–3 day cadence; cloud/quality masking applied) |
+| Spatial resolution | 30 m (HLS Sentinel-2 and Landsat-8/9 tiles) |
+| VI variable | NDVI (Normalized Difference Vegetation Index) |
+| Valid range | −0.1 to 1.0 (values outside this range masked to NaN) |
+
+### 1.2 File Format
+
+Datacubes are CF-1.8 compliant NetCDF4 (HDF5 backend) files with dimensions
+`(time, y, x)` and coordinates stored as:
+
+- `time` — `int32`, "days since 1970-01-01" (proleptic Gregorian calendar)
+- `y` — `float64`, UTM northing in metres
+- `x` — `float64`, UTM easting in metres
+- `spatial_ref` — scalar variable carrying the full CRS WKT string
+
+### 1.3 Coordinate Reference System
+
+All datacubes in this dataset use **WGS 84 / UTM Zone 34S (EPSG:32734)**.
+This projection covers the area between 18°E and 24°E in the southern hemisphere,
+encompassing the Cape Floristic Region of South Africa.
+
+For display in the Plotly heatmap, coordinates are reprojected to
+**WGS84 geographic (EPSG:4326)** using `pyproj.Transformer`.
+
+---
+
+## 2. Vegetation Index
+
+### 2.1 NDVI
+
+The Normalized Difference Vegetation Index (NDVI) is the primary variable:
+
+$$
+\text{NDVI} = \frac{\rho_\text{NIR} - \rho_\text{RED}}{\rho_\text{NIR} + \rho_\text{RED}}
+$$
+
+where ρ_NIR and ρ_RED are surface reflectance in the near-infrared and red bands,
+respectively.  NDVI ranges theoretically from −1 to 1; values above ~0.2 indicate
+photosynthetically active vegetation.
+
+---
+
+## 3. Whittaker Penalized Least-Squares Smoothing
+
+### 3.1 Motivation
+
+Satellite VI time series are unevenly sampled in time due to cloud cover, sensor
+revisit cycles, and quality masking.  Direct fitting of annual phenology models to
+gapped observations is unstable.  The Whittaker smoother interpolates gaps and
+removes high-frequency noise while preserving phenological shape.
+
+### 3.2 Mathematical Formulation
+
+Observations are first mapped onto a **regular daily calendar grid**.  Let:
+
+- **y** ∈ ℝⁿ — NDVI values on the daily grid (0 where no observation)
+- **w** ∈ {0,1}ⁿ — binary weight vector (1 = observed, 0 = gap)
+- **W** = diag(**w**) — diagonal weight matrix
+- **D** ∈ ℝ^{(n−2)×n} — second-order finite difference matrix
+- **λ** > 0 — smoothing parameter
+
+The Whittaker smoother minimises the penalised weighted sum of squares:
+
+$$
+\hat{z} = \arg\min_z \left[ \sum_{i:w_i=1}(y_i - z_i)^2 + \lambda \sum_{j=3}^{n}(\Delta^2 z_j)^2 \right]
+$$
+
+where Δ²zⱼ = zⱼ − 2zⱼ₋₁ + zⱼ₋₂ is the second difference.
+
+This is solved as a sparse linear system:
+
+$$
+(\mathbf{W} + \lambda \mathbf{D}^\top \mathbf{D})\hat{z} = \mathbf{W}\mathbf{y}
+$$
+
+using `scipy.sparse.linalg.spsolve`.
+
+### 3.3 Lambda Parameter
+
+| λ value | Effect |
+|---|---|
+| 10 – 50 | Tight fit to observations; short-period noise retained |
+| 100 – 200 | Balanced smoothing; seasonal shape preserved |
+| 500 (default) | Smooth seasonal envelope; intra-seasonal fluctuations suppressed |
+| 1000 | Very smooth; only broad annual signal retained |
+
+The dashboard exposes λ via a slider (10–1000, step 10).
+
+### 3.4 Implementation Detail
+
+The penalty matrix **λ D^T D** is precomputed once per (n_days, λ) combination
+and cached via `functools.lru_cache`.  **n_days** is the calendar span from the
+first to the last observation in the datacube (~1,262 days for 2016–2019).
+This matrix is shared across all pixel clicks at the same λ setting, making
+repeated pixel selections nearly instantaneous after the first.
+
+### 3.5 Daily Grid Construction
+
+Each observation at time step t is placed at integer position
+`day_offset[t] = (date[t] - date[0]).days` on the daily grid.
+If multiple observations fall on the same calendar day (rare with HLS), their
+values are averaged before smoothing.
+
+---
+
+## 4. Phenological Metric Definitions
+
+All metrics are computed per-pixel from the Whittaker-smoothed daily time series.
+Per-year values are computed within annual calendar windows; multi-year statistics
+are then computed across valid years.
+
+A year is included in the multi-year statistics only if it contains at least
+**5 valid observations** (`min_valid_obs_per_year = 5`).
+
+### 4.1 Peak Group
+
+**peak_ndvi_mean** — Mean annual peak NDVI across years:
+
+$$
+\overline{\text{NDVI}}_{\text{peak}} = \frac{1}{N_y}\sum_{y} \max_{d \in y} \hat{z}_d
+$$
+
+**peak_ndvi_std** — Interannual standard deviation of peak NDVI.
+
+**peak_doy_mean** — Mean day-of-year of peak NDVI:
+
+$$
+\overline{\text{DOY}}_{\text{peak}} = \frac{1}{N_y}\sum_{y} \arg\max_{d \in y}(\hat{z}_d)
+$$
+
+**peak_doy_std** — Interannual standard deviation of peak DOY (in days).
+
+### 4.2 Productivity Group
+
+**integrated_ndvi_mean** — Mean annual integrated NDVI (area under the smoothed
+curve, using the trapezoidal rule):
+
+$$
+\overline{\text{iNDVI}} = \frac{1}{N_y}\sum_y \int_{y} \hat{z}(d)\,\text{d}d \approx \frac{1}{N_y}\sum_y \text{trapz}(\hat{z}_{d \in y})
+$$
+
+Units: NDVI·days yr⁻¹.
+
+**integrated_ndvi_std** — Interannual standard deviation of integrated NDVI.
+
+**greenup_rate_mean** — Mean slope from the annual NDVI floor to the annual peak:
+
+$$
+\overline{\text{GUR}} = \frac{1}{N_y}\sum_y \frac{\hat{z}_{\text{peak},y} - \hat{z}_{\text{floor},y}}{\Delta d_{\text{floor}\to\text{peak},y}}
+$$
+
+Units: NDVI day⁻¹.
+
+**greenup_rate_std** — Interannual standard deviation of green-up rate.
+
+### 4.3 Seasonality Group
+
+**floor_ndvi_mean** — Mean dry-season NDVI floor (annual minimum of smoothed curve):
+
+$$
+\overline{\text{NDVI}}_{\text{floor}} = \frac{1}{N_y}\sum_y \min_{d \in y} \hat{z}_d
+$$
+
+**ceiling_ndvi_mean** — Mean wet-season NDVI ceiling (annual maximum):
+
+$$
+\overline{\text{NDVI}}_{\text{ceiling}} = \frac{1}{N_y}\sum_y \max_{d \in y} \hat{z}_d
+$$
+
+**season_length_mean** — Mean number of days per year during which NDVI exceeds
+the phenological threshold:
+
+$$
+\text{threshold} = \hat{z}_{\text{floor}} + \theta \cdot (\hat{z}_{\text{ceiling}} - \hat{z}_{\text{floor}})
+$$
+
+where θ = 0.20 (20% of annual amplitude) by default.  Season length is the count
+of days above this threshold within the year.
+
+**season_length_std** — Interannual standard deviation of season length (days).
+
+### 4.4 Variability Group
+
+**cv** — Coefficient of variation computed from all raw valid observations across
+the full time series (not per year):
+
+$$
+\text{CV} = \frac{\sigma_{\text{raw}}}{\bar{y}_{\text{raw}}}
+$$
+
+This is the only metric computed from raw (un-smoothed) observations.
+
+**interannual_peak_range** — Range of annual peak NDVI across years:
+
+$$
+\text{range} = \max_y(\hat{z}_{\text{peak},y}) - \min_y(\hat{z}_{\text{peak},y})
+$$
+
+**interannual_peak_std** — Standard deviation of annual peak NDVI across years.
+
+### 4.5 Bimodality Group
+
+These metrics characterise pixels with two distinct growing seasons per year.
+Peak detection uses `scipy.signal.find_peaks` with:
+- `prominence ≥ 0.05` (minimum peak prominence as fraction of range)
+- `distance ≥ 45` days (minimum inter-peak separation)
+
+**n_peaks_mean** — Mean number of detected peaks per year.
+
+**peak_separation_mean** — Mean separation in days between the two highest peaks
+per year (NaN if fewer than 2 peaks detected in a year).
+
+**relative_peak_amplitude_mean** — Mean ratio of the smaller to the larger of the
+two highest peaks:
+
+$$
+\text{rPA} = \frac{\min(\hat{z}_{\text{peak1}},\hat{z}_{\text{peak2}})}{\max(\hat{z}_{\text{peak1}},\hat{z}_{\text{peak2}})}
+$$
+
+Ranges from 0 (strongly asymmetric bimodality) to 1 (equal peak heights).
+
+**valley_depth_mean** — Mean normalised depth of the valley between the two
+highest peaks:
+
+$$
+\text{VD} = 1 - \frac{\hat{z}_{\text{valley}}}{\frac{\hat{z}_{\text{peak1}} + \hat{z}_{\text{peak2}}}{2}}
+$$
+
+Values near 0 indicate a shallow valley; values near 1 indicate a deep
+inter-peak trough.
+
+---
+
+## 5. Dashboard Memory Architecture
+
+### 5.1 Design Principle
+
+The full datacube array is **never loaded into memory**.  The largest file
+(G5_14) contains ~1.17 billion float32 values (~4.36 GB uncompressed after
+decompression of a 2.6 GB compressed file).  Loading such a file would exceed
+typical workstation RAM budgets and make multi-region sessions impossible.
+
+### 5.2 Basemap Computation
+
+The spatial basemap metric is computed lazily using Dask:
+
+1. `xr.open_dataset(..., chunks={})` — opens the file respecting its native HDF5
+   chunk layout; no data is read.
+2. `da.chunk({'time': -1})` — rechunks the time axis so each spatial tile holds
+   the full time series; still lazy.
+3. `da.coarsen(y=cf_y, x=cf_x).mean()` — adds spatial averaging to the graph;
+   still lazy.
+4. `da_coarse.max(dim='time').compute()` — triggers execution.  Dask reads and
+   decompresses each tile once, aggregates along time, then discards the tile.
+   Peak memory ≈ one tile × time axis ≈ 200 × 200 × 1287 × 4 bytes ≈ 200 MB.
+5. The result is a small (≤ 500 × 500) float32 array.
+
+For the largest files this computation takes 10–25 seconds; results are cached
+in Shiny's reactive graph until the region or metric changes.
+
+### 5.2.1 Basemap Display (ipyleaflet)
+
+The metric array is reprojected from the UTM grid onto a regular WGS84 grid
+(nearest-neighbour via `scipy.interpolate.RegularGridInterpolator`), then
+rendered as a PNG image overlay on an `ipyleaflet.Map`.  A satellite tile
+layer (default: ESRI World Imagery) is displayed underneath.  The tile service,
+overlay opacity, and colorscale clipping range (full / Mean ± N SD) are all
+adjustable in the sidebar without triggering a Dask recompute.
+
+Pixel selection is handled by the `Map.on_interaction` callback: on a click event,
+the (lat, lon) coordinates from ipyleaflet are converted back to UTM and
+nearest-neighbour matched to an array index `(yi, xi)`.
+
+### 5.3 Pixel Time Series Extraction
+
+Single-pixel reads use the netCDF4 library's direct HDF5 hyperslab API:
+
+```python
+vi_arr = nc4_dataset.variables["NDVI"][:, yi, xi]
+```
+
+This is a 3-element index that the HDF5 library translates to a single hyperslab
+read request.  For a (1287, 2222, 409) file, only the T = 1287 float32 values
+for the selected pixel are decompressed (≈ 5 KB).  Typical latency: 10–200 ms
+depending on file size and disk speed.
+
+### 5.4 ZARR Optimisation
+
+NetCDF4's HDF5 backend uses default or spatial chunking.  For a 1287×2222×409
+array with default HDF5 auto-chunking, a single-pixel time series read may
+require decompressing hundreds of spatial chunks.
+
+ZARR stores rechunked to `{'time': -1, 'y': 10, 'x': 10}` place each 10×10
+block's full time series in a single Blosc-compressed chunk.  A single-pixel
+read decompresses at most 1–4 chunks (depending on pixel location relative to
+chunk boundaries), reducing latency by 10–100× for large files.
+
+---
+
+## 6. Software Dependencies
+
+| Package | Version | Role |
+|---|---|---|
+| Python | 3.11 | Runtime |
+| shiny | ≥ 0.10 | Web framework and reactive system |
+| shinywidgets | ≥ 0.3 | Plotly FigureWidget ↔ Shiny bridge |
+| plotly | ≥ 5.17 | Interactive heatmap and time series |
+| xarray | current | Lazy datacube access via Dask |
+| dask | current | Parallel lazy computation |
+| netCDF4 | current | Direct HDF5 hyperslab reads |
+| scipy | current | Sparse linear solver (`spsolve`) for Whittaker |
+| numpy | current | Array operations |
+| pandas | current | Date arithmetic |
+| pyproj | current | CRS reprojection (UTM → WGS84) |
+| zarr | current | Rechunked storage format |
+| pillow | current | Image utilities |
+
+### 6.1 Core Metric Functions
+
+The three Whittaker and metric functions are reproduced verbatim from the
+VI_Phenology pipeline and live in `modules/phenology_metrics.py`:
+
+| Function | Purpose |
+|---|---|
+| `_build_whittaker_system(n_days, lam)` | Builds sparse λ D^T D penalty matrix |
+| `_whittaker_smooth_pixel(daily_y, daily_w, lam_DTD)` | Solves (W + λ D^T D) z = W y |
+| `_extract_pixel_metrics(pixel_ts, lam_DTD, config, date_cache)` | Computes all 19 metrics |
+
+They are copied rather than imported to avoid the heavy top-level dependencies
+(matplotlib, tqdm, io_utils) in the original pipeline module.  The mathematical
+logic is identical to the upstream source.
+
+The dashboard is fully self-contained — no external VI_Phenology source tree is
+required at runtime.
+
+### 6.2 Time-Series Visualisation Panels
+
+After a pixel is selected, three panels are available:
+
+| Tab | Content |
+|---|---|
+| Raw NDVI | Raw observations (grey scatter) + Whittaker-smoothed daily curve (green line) over the full date range |
+| Annual Cycles | Per-calendar-year DOY overlay: each year's smoothed curve plotted on a 1–366 axis, with a black cross-year mean trace |
+| Metric Trends | Per-year scatter for each of the 11 trackable metrics, with a dashed mean line and grey ± std band |
+
+All three panels update when λ changes, as they share the same `smoothed_result`
+and `pixel_annual_data` reactive calculations.
+
+---
+
+## 7. Data Quality and Limitations
+
+- **Cloud masking** — Quality-masked pixels appear as NaN.  Pixels with fewer
+  than 20 valid observations (`min_valid_obs`) across the full time series produce
+  `NaN` for all metrics.
+- **Bimodality metrics** — `peak_separation_mean`, `relative_peak_amplitude_mean`,
+  and `valley_depth_mean` are `NaN` for pixels where fewer than 2 peaks are
+  detected in most years.
+- **Coordinate reprojection accuracy** — UTM→WGS84 reprojection introduces sub-pixel
+  error at display resolution (< 0.5 pixel for regions < 200 km across).
+- **Basemap downsampling** — The displayed heatmap is downsampled to ≤ 500 × 500 pixels
+  for performance.  Sub-pixel spatial detail is not visible; the full-resolution
+  pixel is used for time series extraction.
+- **Lambda range** — λ must be > 0.  The slider minimum of 10 prevents near-zero
+  values that would cause numerical instability in the sparse solver.
+
+---
+
+## 8. References
+
+Eilers, P.H.C. (2003). A perfect smoother. *Analytical Chemistry*, 75(14), 3631–3636.
+https://doi.org/10.1021/ac034173t
+
+Sentinel-2 HLS product: Claverie, M. et al. (2018). The Harmonized Landsat and
+Sentinel-2 surface reflectance data set. *Remote Sensing of Environment*, 219, 145–161.
+
+BioSCape campaign: https://www.bioscape.io

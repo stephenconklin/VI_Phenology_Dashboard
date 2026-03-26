@@ -1,0 +1,24 @@
+name: vi_phenology_dashboard
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - xarray
+  - netcdf4
+  - dask
+  - scipy
+  - plotly>=5.17
+  - pyproj
+  - zarr
+  - pillow
+  - matplotlib
+  - ipyleaflet
+  - tqdm
+  - pip
+  - pip:
+    - shiny>=0.10
+    - shinywidgets>=0.3
+    - faicons
