@@ -48,6 +48,7 @@ from modules.datacube_io import (
     RegionPaths,
     basemap_cache_path,
     build_date_cache,
+    build_date_cache_from_dates,
     click_to_array_index,
     compute_basemap_metric,
     detect_crs_epsg,
@@ -72,6 +73,7 @@ from modules.visualization import (
     make_leaflet_map,
     make_metrics_annual_figure,
     make_metrics_table,
+    make_phenology_scatter_figure,
     make_timeseries_figure,
     update_leaflet_map,
 )
@@ -217,6 +219,7 @@ app_ui = ui.page_sidebar(
             },
             selected="3sd",
         ),
+        ui.output_ui("year_range_slider"),
         ui.output_ui("shapefile_toggles"),
         ui.output_ui("colorbar_panel"),
 
@@ -359,6 +362,10 @@ app_ui = ui.page_sidebar(
                 style="height:100%;overflow-y:auto;",
             ),
         ),
+        ui.nav_panel(
+            "Phenology Scatter",
+            output_widget("phenology_scatter_widget"),
+        ),
         id="ts_tabs",
         selected="Raw VI",
         full_screen=True,
@@ -394,7 +401,7 @@ def server(input: Inputs, output: Outputs, session: Session):
     # Reactive state for pixel selection
     # -----------------------------------------------------------------------
 
-    selected_idx:    reactive.Value[tuple[int, int] | None] = reactive.Value(None)
+    selected_idx:    reactive.Value[tuple[str, int, int] | None] = reactive.Value(None)
     selected_coords: reactive.Value[tuple[float, float] | None] = reactive.Value(None)
 
     # Non-reactive per-session reference to the current basemap FigureWidget.
@@ -526,22 +533,46 @@ def server(input: Inputs, output: Outputs, session: Session):
         return z_mean - n_sd * z_std, z_mean + n_sd * z_std
 
     @reactive.Calc
+    def effective_selected_idx() -> tuple[int, int] | None:
+        """
+        Return (yi, xi) for the selected pixel IFF it belongs to the current
+        region and is within bounds; otherwise None.
+
+        Reading input.region() here means this calc invalidates in the SAME
+        reactive flush as region_paths() when the region changes.  No separate
+        _reset_selection effect is needed to clear selected_idx, so
+        pixel_timeseries (and pixel_stats_panel downstream) receive exactly one
+        invalidation per region switch instead of two.
+        """
+        idx = selected_idx()
+        if idx is None:
+            return None
+        stored_region, yi, xi = idx
+        if stored_region != input.region():
+            return None
+        ds = active_dataset()
+        ny, nx = ds.dims["y"], ds.dims["x"]
+        if yi >= ny or xi >= nx:
+            return None
+        return (yi, xi)
+
+    @reactive.Calc
     def pixel_timeseries() -> PixelTimeSeries | None:
         """
         Extract raw time series for the selected pixel via HDF5 hyperslab.
         Triggered by: pixel click OR region change.
         """
-        idx = selected_idx()
+        idx = effective_selected_idx()
         if idx is None:
             return None
         yi, xi = idx
         paths = region_paths()
         try:
             return extract_pixel_timeseries(
-            paths.nc_path, yi, xi,
-            vi_var=paths.vi_var,
-            zarr_path=paths.zarr_path,
-        )
+                paths.nc_path, yi, xi,
+                vi_var=paths.vi_var,
+                zarr_path=paths.zarr_path,
+            )
         except Exception as exc:
             ui.notification_show(f"Pixel read error: {exc}", type="error", duration=6)
             return None
@@ -550,24 +581,39 @@ def server(input: Inputs, output: Outputs, session: Session):
     def narrowed_timeseries() -> PixelTimeSeries | None:
         """
         PixelTimeSeries with valid_mask restricted to observations that fall
-        within the active data range (colorscale_limits).  All smoothing and
-        metric computation uses this rather than the full physical series, so
-        that the Data Range control genuinely filters the analysis.
-
-        When the range is "full" (zmin/zmax both None), returns the original
-        pixel_timeseries unchanged.
+        within the active data range (colorscale_limits) and year range
+        (year_range_slider).  All smoothing and metric computation uses this
+        rather than the full physical series, so that both filter controls
+        genuinely affect the analysis.
         """
         ts = pixel_timeseries()
         if ts is None:
             return None
         zmin, zmax = colorscale_limits()
-        if zmin is None and zmax is None:
-            return ts
         mask = ts.valid_mask.copy()
         if zmin is not None:
             mask &= ts.raw_vi >= float(zmin)
         if zmax is not None:
             mask &= ts.raw_vi <= float(zmax)
+        try:
+            yr_start, yr_end = input.year_range()
+            obs_years = ts.dates.astype("datetime64[Y]").astype(int) + 1970
+            year_keep = (obs_years >= yr_start) & (obs_years <= yr_end)
+            mask &= year_keep
+            # Clip the arrays to the year range so that the Whittaker daily
+            # grid (built from ts.dates[0]…ts.dates[-1]) only spans the
+            # selected years — preventing extrapolation outside them.
+            return PixelTimeSeries(
+                dates=ts.dates[year_keep],
+                raw_vi=ts.raw_vi[year_keep],
+                valid_mask=mask[year_keep],
+                x_coord=ts.x_coord,
+                y_coord=ts.y_coord,
+                lon=ts.lon,
+                lat=ts.lat,
+            )
+        except Exception:
+            pass  # slider not yet rendered (dynamic UI not initialized)
         return PixelTimeSeries(
             dates=ts.dates,
             raw_vi=ts.raw_vi,
@@ -609,6 +655,20 @@ def server(input: Inputs, output: Outputs, session: Session):
         return {**PIXEL_METRIC_CONFIG, "vi_min": vi_min, "vi_max": vi_max}
 
     @reactive.Calc
+    def pixel_date_cache() -> dict:
+        """
+        Date cache scoped to the active (year-filtered) pixel time series.
+        When year filtering clips ts.dates, this cache covers only those dates,
+        so the Whittaker daily grid — and thus smoothing — is bounded to the
+        selected range with no extrapolation outside it.
+        Falls back to the full region date cache when no pixel is selected.
+        """
+        ts = narrowed_timeseries()
+        if ts is None or len(ts.dates) < 2:
+            return dataset_date_cache()
+        return build_date_cache_from_dates(ts.dates)
+
+    @reactive.Calc
     def pixel_annual_data():
         """
         Full annual breakdown: (metrics, valid_years, annual_data).
@@ -617,7 +677,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         ts = narrowed_timeseries()
         if ts is None:
             return None
-        dc = dataset_date_cache()
+        dc = pixel_date_cache()
         return compute_pixel_with_annual(
             ts, dc, float(input.lambda_val()), pixel_metric_config()
         )
@@ -695,7 +755,7 @@ def server(input: Inputs, output: Outputs, session: Session):
                     and float(lat.min()) <= click_lat <= float(lat.max())):
                 return
             yi, xi = click_to_array_index(click_lon, click_lat, ds)
-            selected_idx.set((yi, xi))
+            selected_idx.set((region, yi, xi))
             selected_coords.set((click_lon, click_lat))
 
         m.on_interaction(_on_interaction)
@@ -747,6 +807,25 @@ def server(input: Inputs, output: Outputs, session: Session):
             zmin=zmin,
             zmax=zmax,
             selected_pixel=coords,
+        )
+
+    # -----------------------------------------------------------------------
+    # Year range slider (dynamic — bounds derived from the active dataset)
+    # -----------------------------------------------------------------------
+
+    @render.ui
+    def year_range_slider():
+        years = dataset_date_cache()["years"]
+        yr_min, yr_max = int(years.min()), int(years.max())
+        return ui.input_slider(
+            id="year_range",
+            label="Year range",
+            min=yr_min,
+            max=yr_max,
+            value=[yr_min, yr_max],
+            step=1,
+            sep="",
+            ticks=False,
         )
 
     # -----------------------------------------------------------------------
@@ -827,6 +906,22 @@ def server(input: Inputs, output: Outputs, session: Session):
         )
 
     @render_widget
+    def phenology_scatter_widget():
+        ts = narrowed_timeseries()
+        if ts is None:
+            return make_empty_timeseries_figure()
+        zmin, zmax = colorscale_limits()
+        return make_phenology_scatter_figure(
+            ts=ts,
+            vi_var=region_paths().vi_var,
+            lam=float(input.lambda_val()),
+            region_id=input.region(),
+            basemap_metric=basemap_metric_key(),
+            zmin=zmin,
+            zmax=zmax,
+        )
+
+    @render_widget
     def metrics_annual_widget():
         result = pixel_annual_data()
         if result is None:
@@ -856,8 +951,8 @@ def server(input: Inputs, output: Outputs, session: Session):
                 "No pixel selected. Click on the map.",
                 style="color:#999;font-size:0.82em;font-style:italic",
             )
-        lon, lat = coords
-        yi, xi   = idx
+        lon, lat        = coords
+        _, yi, xi       = idx
 
         # Pull observation stats from both full and narrowed time series
         ts_full = pixel_timeseries()
@@ -949,7 +1044,10 @@ def server(input: Inputs, output: Outputs, session: Session):
     @reactive.Effect
     @reactive.event(input.region)
     def _reset_selection():
-        selected_idx.set(None)
+        # Clear the map marker only. selected_idx is NOT reset here because
+        # effective_selected_idx() handles region mismatch atomically in the
+        # same reactive flush as the region change, avoiding the double-
+        # invalidation that caused client state machine errors on pixel_stats_panel.
         selected_coords.set(None)
 
 

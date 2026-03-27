@@ -20,8 +20,9 @@ compute and visualise its full Whittaker-smoothed phenology time series plus
 | Spatial basemap | ipyleaflet map with metric colour overlay on satellite imagery |
 | Shapefile overlays | Display one or more vector overlays (shapefiles / GeoJSON) with labels; toggled via sidebar checkboxes |
 | Click-to-select | Click any pixel on the map to load its time series; clicks outside the data extent are ignored |
-| Time series plot | Raw VI observations + Whittaker-smoothed curve (3 tabs) |
-| Data range filter | Restrict the analysis to a VI sub-range — affects all plots and metrics |
+| Time series plot | Raw VI observations + Whittaker-smoothed curve (4 tabs) |
+| Data range filter | Restrict the analysis to a VI amplitude sub-range — affects all plots and metrics |
+| Year range slider | Double-handle slider to restrict analysis to a calendar year window — clips observations, smoothing, and all plots to the selected years |
 | Lambda slider | Adjust smoothing (λ = 10–1000) and see results update live |
 | 19-metric sidebar | All phenological metrics for the selected pixel, grouped by category |
 | ZARR acceleration | Optional one-time rechunking for fast pixel reads on large files |
@@ -115,19 +116,21 @@ The dashboard discovers all regions automatically at startup.
 ## Dashboard Layout
 
 ```
-┌─ Sidebar (310 px) ──────────┐  ┌─ Main panel ─────────────────────────────────────────┐
+┌─ Sidebar (420 px) ──────────┐  ┌─ Main panel ─────────────────────────────────────────┐
 │  Region     [G5_1 ▼]        │  │  ┌─ Spatial map (ipyleaflet) ───────────────────────┐ │
 │  Basemap    [Peak NDVI ▼]   │  │  │  Satellite basemap + metric colour overlay        │ │
 │  Basemap style [Imagery ▼]  │  │  │  Click any pixel → red marker + time series load  │ │
 │  Metric opacity [─●──]      │  │  └─────────────────────────────────────────────────┘ │
-│  Data range  [Mean±2SD ▼]   │  │                                                       │
-│  [colorbar]                 │  │  ┌─ Tabs ──────────────────────────────────────────┐  │
-│  λ smoothing [────●────]    │  │  │  Raw VI   │ Annual Cycles │ Metric Trends        │  │
-│  10          500       1000 │  │  │  ─────────────────────────────────────────────  │  │
-│  ─────────────────────────  │  │  │  Raw obs (grey) + Whittaker-smooth (green)       │  │
-│  Selected pixel             │  │  │    OR  per-DOY curves by year                   │  │
-│  Lat -33.4821°              │  │  │    OR  per-year metric scatter + mean ± std      │  │
-│  Lon  19.2341°              │  │  └─────────────────────────────────────────────────┘  │
+│  Data range  [Mean±3SD ▼]   │  │                                                       │
+│  Year range [●────────●]    │  │  ┌─ Tabs ──────────────────────────────────────────┐  │
+│  2017              2024     │  │  │  Raw VI  │ Annual Cycles │ Metric Trends │ Scatter│  │
+│  [colorbar]                 │  │  │  ─────────────────────────────────────────────  │  │
+│  λ smoothing [────●────]    │  │  │  Raw obs (grey) + Whittaker-smooth (green)       │  │
+│  10          500       1000 │  │  │    OR  per-DOY curves by year                   │  │
+│  ─────────────────────────  │  │  │    OR  per-year metric scatter + mean ± std      │  │
+│  Selected pixel             │  │  │    OR  phenology scatter                        │  │
+│  Lat -33.4821°              │  │  └─────────────────────────────────────────────────┘  │
+│  Lon  19.2341°              │  │                                                       │
 │  Valid obs: 842/1287 (65%)  │  │                                                       │
 │  In range: 782/842 (93%)    │  │                                                       │
 │  Date range: 2016-01 →      │  │                                                       │
@@ -154,12 +157,14 @@ The dashboard discovers all regions automatically at startup.
 3. **Choose a basemap style** (satellite imagery, OpenStreetMap, etc.) and adjust **opacity**.
 4. **Click any pixel** on the map — a red marker appears and the time series loads.
 5. **Adjust the lambda slider** to change Whittaker smoothing — the curve and all 19 metrics update instantly.
-6. Optionally set a **Data range** (VI sub-range) — only observations within the range are used for smoothing, all plots, and all 19 metrics.  The sidebar shows both the total valid observation count and the in-range count.
-7. The **19 phenological metrics** appear in the sidebar, grouped by category.
-8. Switch between **three time-series tabs**:
-   - **Raw VI** — raw observations + Whittaker-smoothed curve, full date range
+6. Optionally set a **Data range** (VI amplitude sub-range) — only observations within the VI range are used for smoothing, all plots, and all 19 metrics.  The sidebar shows both the total valid observation count and the in-range count.
+7. Optionally set a **Year range** using the double-handle slider — restricts all observations, the Whittaker daily grid, smoothing, and every plot to the selected calendar years.  No data outside the range is plotted, smoothed, or extrapolated.  The slider bounds automatically update when a new region is selected.
+8. The **19 phenological metrics** appear in the sidebar, grouped by category.
+9. Switch between **four time-series tabs**:
+   - **Raw VI** — raw observations + Whittaker-smoothed curve, zoomed to the active year range
    - **Annual Cycles** — per-DOY overlay by calendar year (seasonal shape comparison)
    - **Metric Trends** — annual scatter plots for each metric with mean ± std bands
+   - **Phenology Scatter** — scatter plot of any two phenology metrics
 
 ---
 
@@ -184,7 +189,8 @@ available as basemap options too.
 |---|---|
 | Basemap style | Tile service: World Imagery (default), OpenStreetMap, Topo, Light Gray |
 | Metric layer opacity | 0–1 slider controlling transparency of the colour overlay |
-| Data range | Clip colorbar to full range, Mean ± 1/2/3 SD; **also filters the VI observations used for all pixel-level analysis** (smoothing, metrics, all three time-series tabs) |
+| Data range | Clip colorbar to full range, Mean ± 1/2/3 SD; **also filters the VI observations used for all pixel-level analysis** (smoothing, metrics, all four time-series tabs) |
+| Year range | Double-handle slider (start year – end year); **restricts the Whittaker daily grid to the selected years** — no observations, smoothing, or extrapolation occurs outside the range.  Slider bounds are derived from the active dataset and reset automatically on region change. |
 
 ---
 
@@ -409,6 +415,11 @@ high-coverage area of the basemap (use "Data Coverage" as the basemap metric to 
 
 **Annual Cycles / Metric Trends tab is empty** — The selected pixel may have
 insufficient observations per year (`min_valid_obs_per_year = 5` in `PIXEL_METRIC_CONFIG`).
+If a **Year range** is active, narrowing the window further reduces the observation pool; try widening the year range or selecting a pixel with denser coverage.
+
+**Plots are blank after adjusting Year range** — The selected year window may contain
+fewer than `min_valid_obs = 20` valid observations for the pixel.  Widen the year range
+or clear the Data range filter to increase the observation count.
 
 **Phenology metrics not available as basemap options** — Run
 `python tools/pixel_phenology_extract.py --region G5_xx` to generate

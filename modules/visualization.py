@@ -25,6 +25,7 @@ import pandas as pd
 from plotly.subplots import make_subplots as _make_subplots
 
 from config import METRIC_LABELS, METRIC_GROUPS, VI_VALID_RANGE
+from modules.phenology_metrics import _build_whittaker_system, _whittaker_smooth_pixel
 
 
 class SatelliteImage(NamedTuple):
@@ -677,7 +678,7 @@ def add_shapefile_overlay(
         icon = ipl.DivIcon(
             html=f'<div style="'
                  f'color:#ffffff;'
-                 f'font-size:11px;'
+                 f'font-size:16px;'
                  f'font-weight:bold;'
                  f'text-shadow:0 0 3px #000,0 0 3px #000;'
                  f'white-space:nowrap;'
@@ -982,6 +983,105 @@ def make_annual_cycle_figure(
             autosize=True,
             margin=dict(l=60, r=20, t=70, b=50),
             uirevision=f"annual_cycle-{zmin}-{zmax}",
+            plot_bgcolor="#f8f8f8",
+        ),
+    )
+
+
+def make_phenology_scatter_figure(
+    ts: "PixelTimeSeries",
+    vi_var: str,
+    lam: float,
+    region_id: str,
+    basemap_metric: str | None = None,
+    zmin: float | None = None,
+    zmax: float | None = None,
+) -> go.FigureWidget:
+    """
+    DOY × VI scatter of all valid observations, coloured by year via a
+    continuous Plasma colorscale, with a Whittaker-smoothed mean fit line
+    computed from the per-DOY mean of the raw observations.
+    """
+    valid_dates = ts.dates[ts.valid_mask]
+    vi_vals = ts.raw_vi[ts.valid_mask].astype(np.float64)
+
+    if len(vi_vals) == 0:
+        return make_empty_timeseries_figure()
+
+    dates_dt = pd.DatetimeIndex(valid_dates.astype("datetime64[ns]"))
+    doy_arr = dates_dt.day_of_year.to_numpy()   # 1–366
+    year_arr = dates_dt.year.to_numpy()
+
+    # --- scatter trace (all observations, coloured by year) ---
+    scatter = go.Scatter(
+        x=doy_arr.tolist(),
+        y=vi_vals.tolist(),
+        mode="markers",
+        marker=dict(
+            color=year_arr.tolist(),
+            colorscale="Plasma",
+            colorbar=dict(title="Year", thickness=14, len=0.7),
+            size=4,
+            opacity=0.55,
+        ),
+        name="Observations",
+        hovertemplate="DOY %{x}, %{marker.color}: %{y:.4f}<extra></extra>",
+    )
+
+    # --- per-DOY mean → Whittaker smooth ---
+    daily_y = np.zeros(366, dtype=np.float64)
+    daily_w = np.zeros(366, dtype=np.float64)
+    day_count = np.zeros(366, dtype=np.float64)
+    idx = doy_arr - 1  # 0-based index into 366-element arrays
+    np.add.at(daily_y, idx, vi_vals)
+    np.add.at(day_count, idx, 1.0)
+    hit = day_count > 0
+    daily_y[hit] /= day_count[hit]
+    daily_w[hit] = 1.0
+
+    lam_DTD = _build_whittaker_system(366, lam)
+    smoothed_doy = _whittaker_smooth_pixel(daily_y, daily_w, lam_DTD)
+
+    mean_line = go.Scatter(
+        x=list(range(1, 367)),
+        y=smoothed_doy.tolist(),
+        mode="lines",
+        name="Mean fit",
+        line=dict(color="#000000", width=2.5),
+        hovertemplate="Mean fit, DOY %{x}: %{y:.4f}<extra></extra>",
+    )
+
+    # --- y-axis autoscale from scatter data ---
+    _dmin, _dmax = float(vi_vals.min()), float(vi_vals.max())
+    _pad = max((_dmax - _dmin) * 0.08, 0.02)
+    y_range = [_dmin - _pad, _dmax + _pad]
+
+    return go.FigureWidget(
+        data=[scatter, mean_line],
+        layout=go.Layout(
+            title=dict(
+                text=f"{region_id} — {vi_var} Phenology Scatter",
+                font=dict(size=13),
+            ),
+            xaxis=dict(
+                title="Day of Year",
+                range=[1, 366],
+                showgrid=True,
+                gridcolor="#e0e0e0",
+            ),
+            yaxis=dict(
+                title=vi_var,
+                range=y_range,
+                showgrid=True,
+                gridcolor="#e0e0e0",
+            ),
+            legend=dict(
+                orientation="h", yanchor="bottom", y=1.01, x=0,
+                font=dict(size=10),
+            ),
+            autosize=True,
+            margin=dict(l=60, r=20, t=70, b=50),
+            uirevision=f"phenology_scatter-{zmin}-{zmax}",
             plot_bgcolor="#f8f8f8",
         ),
     )

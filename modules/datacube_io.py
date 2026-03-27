@@ -351,6 +351,32 @@ def build_date_cache(ds: xr.Dataset) -> dict:
     }
 
 
+def build_date_cache_from_dates(obs_dates: np.ndarray) -> dict:
+    """
+    Build a date_cache dict from a datetime64[D] array of observation dates.
+    Equivalent to build_date_cache() but takes a date array instead of a Dataset.
+    Used when the active date range has been clipped (e.g. by the year-range slider).
+    """
+    times = pd.DatetimeIndex(obs_dates.astype("datetime64[ns]"))
+    n_days = (times[-1] - times[0]).days + 1
+    all_dates = pd.date_range(start=times[0], periods=n_days, freq="D")
+    year_arr  = all_dates.year.values.astype(np.int32)
+    doy_arr   = all_dates.dayofyear.values.astype(np.int16)
+    years     = np.unique(year_arr)
+    day_offsets = np.array(
+        [(t - times[0]).days for t in times],
+        dtype=np.int32,
+    )
+    return {
+        "n_days":      n_days,
+        "year_arr":    year_arr,
+        "doy_arr":     doy_arr,
+        "years":       years,
+        "year_masks":  {int(yr): (year_arr == yr) for yr in years},
+        "day_offsets": day_offsets,
+    }
+
+
 # ---------------------------------------------------------------------------
 # WGS84 regridding helper
 # ---------------------------------------------------------------------------

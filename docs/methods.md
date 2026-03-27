@@ -120,15 +120,18 @@ The dashboard exposes λ via a slider (10–1000, step 10).
 ### 3.4 Implementation Detail
 
 The penalty matrix **λ D^T D** is precomputed once per (n_days, λ) combination
-and cached via `functools.lru_cache`.  **n_days** is the calendar span from the
-first to the last observation in the datacube (~1,262 days for 2016–2019).
-This matrix is shared across all pixel clicks at the same λ setting, making
-repeated pixel selections nearly instantaneous after the first.
+and cached via `functools.lru_cache`.  **n_days** is the calendar span of the
+**active observation window** — normally the full dataset span (~1,262 days for
+2016–2019), but reduced to the selected year range when the Year range filter is
+active (see §5.2.3).  The cache key includes n_days, so a different year window
+produces a separate, appropriately-sized penalty matrix.  This matrix is shared
+across all pixel clicks at the same (λ, year range) setting, making repeated
+pixel selections nearly instantaneous after the first.
 
-The `spsolve` is called **once** per (pixel, λ, data-range) combination.
+The `spsolve` is called **once** per (pixel, λ, data-range, year-range) combination.
 `compute_pixel_with_annual()` returns the smoothed daily curve alongside the
-19 aggregated metrics and per-year arrays; the Raw VI and Annual Cycles displays
-derive from this single result rather than running a separate solve.
+19 aggregated metrics and per-year arrays; the Raw VI, Annual Cycles, Metric Trends,
+and Phenology Scatter displays all derive from this single result.
 
 ### 3.5 Daily Grid Construction
 
@@ -329,14 +332,14 @@ nearest-neighbour matched to an array index `(yi, xi)`.
 
 ### 5.2.2 Data Range Filter
 
-The **Data range** sidebar control defines a VI sub-range [z_min, z_max].  It does
-two things simultaneously:
+The **Data range** sidebar control defines a VI amplitude sub-range [z_min, z_max].
+It does two things simultaneously:
 
 1. **Colorbar clipping** — the colour ramp on the basemap overlay is stretched to
    [z_min, z_max] so spatial variation within the range is maximally visible.
 
 2. **Observation filter** — all pixel-level analysis is restricted to observations
-   within the range.  This is implemented via a `narrowed_timeseries()` reactive
+   within the VI range.  This is implemented via a `narrowed_timeseries()` reactive
    calculation that copies the `PixelTimeSeries` struct with a modified `valid_mask`:
 
    ```
@@ -346,8 +349,9 @@ two things simultaneously:
    ```
 
    Every downstream reactive — Whittaker smoothing, all 19 phenological metrics,
-   the raw-VI scatter, the Annual Cycles overlay, and the Metric Trends plots —
-   reads from `narrowed_timeseries()` rather than the full pixel time series.
+   the raw-VI scatter, the Annual Cycles overlay, the Metric Trends, and Phenology
+   Scatter plots — reads from `narrowed_timeseries()` rather than the full pixel
+   time series.
 
 The `pixel_metric_config()` reactive additionally clamps the per-VI physical valid
 range (from `VI_VALID_RANGE`) to [z_min, z_max], so metric-quality checks (e.g.,
@@ -359,6 +363,45 @@ and there is no performance penalty.
 The sidebar shows both the total valid observation count and the in-range count
 (e.g., "In range: 782 / 842 valid (93%)") so the effect of the filter is immediately
 visible.
+
+### 5.2.3 Year Range Filter
+
+The **Year range** double-handle slider restricts the entire pixel analysis pipeline
+to a user-selected calendar year window [yr_start, yr_end].  Unlike the Data range
+filter, which acts only on VI amplitude, the Year range filter acts on the **temporal
+extent** of both the observations and the Whittaker daily grid.
+
+The implementation has two layers:
+
+1. **Array clipping in `narrowed_timeseries()`** — after applying the VI amplitude
+   mask, observations whose dates fall outside [yr_start, yr_end] are removed from
+   the `PixelTimeSeries` arrays entirely (not merely masked):
+
+   ```
+   year_keep = (obs_years >= yr_start) & (obs_years <= yr_end)
+   ts.dates      = ts.dates[year_keep]
+   ts.raw_vi     = ts.raw_vi[year_keep]
+   ts.valid_mask = ts.valid_mask[year_keep]
+   ```
+
+   This ensures the clipped `ts.dates` spans only the selected years, so the Whittaker
+   daily grid — sized `(ts.dates[-1] − ts.dates[0]).days + 1` — covers only that window.
+
+2. **Date cache rebuild in `pixel_date_cache()`** — a new date_cache is constructed
+   from the clipped `ts.dates` via `build_date_cache_from_dates()`.  This cache
+   determines `n_days`, `day_offsets`, `years`, and `year_masks` for the smoothing
+   and metric computation.  Because the Whittaker system is sized to the new (shorter)
+   `n_days`, the solver has **no observations or grid points outside the selected
+   range** — there is strictly no extrapolation beyond the year window.
+
+   `pixel_annual_data()` uses `pixel_date_cache()` rather than the region-level
+   `dataset_date_cache()`, so the smaller penalty matrix is also cached separately
+   (keyed on its own n_days value).
+
+The slider bounds are derived from `dataset_date_cache()["years"]` and rendered via
+a dynamic `@render.ui` block, so they automatically update to match the year span of
+whichever region is currently selected.  When the full year span is selected (slider
+at both extremes), the behaviour is identical to having no year range filter.
 
 ### 5.3 Pixel Time Series Extraction
 
@@ -456,14 +499,15 @@ After a pixel is selected, three panels are available:
 
 | Tab | Content |
 |---|---|
-| Raw VI | Raw observations (grey scatter) + Whittaker-smoothed daily curve (green line) over the full date range |
-| Annual Cycles | Per-calendar-year DOY overlay: each year's smoothed curve plotted on a 1–366 axis, with a black cross-year mean trace |
+| Raw VI | Raw observations (grey scatter) + Whittaker-smoothed daily curve (green line), zoomed to the active year range |
+| Annual Cycles | Per-calendar-year DOY overlay: each year's smoothed curve plotted on a 1–366 axis, with a black cross-year mean trace; only selected years appear |
 | Metric Trends | Per-year scatter for each of the 11 trackable metrics, with a dashed mean line and grey ± std band |
+| Phenology Scatter | Scatter plot of any two phenological metrics across observations |
 
-All three panels update when λ changes or the Data range filter changes, as they
-all share `narrowed_timeseries()` → `smoothed_result` → `pixel_annual_data` in the
-reactive graph.  The y-axis bounds and label are set dynamically from `VI_VALID_RANGE`
-for the current region's VI type.
+All four panels update when λ, the Data range filter, or the Year range slider
+changes, as they all share `narrowed_timeseries()` → `pixel_date_cache()` →
+`pixel_annual_data()` in the reactive graph.  The y-axis bounds and label are set
+dynamically from `VI_VALID_RANGE` for the current region's VI type.
 
 ---
 
@@ -476,6 +520,11 @@ for the current region's VI type.
   pool.  If the filtered count falls below `min_valid_obs`, all metrics show N/A
   for that pixel.  The sidebar shows both the full valid count and the in-range
   count to make this visible.
+- **Year range filter** — Narrowing the year range reduces both the observation
+  pool and the temporal span of the Whittaker grid.  If the filtered window
+  contains fewer than `min_valid_obs = 20` valid observations the pixel returns
+  N/A for all metrics.  The Data range and Year range filters stack: both must
+  pass simultaneously for an observation to be included.
 - **Bimodality metrics** — `peak_separation_mean`, `relative_peak_amplitude_mean`,
   and `valley_depth_mean` are `NaN` for pixels where fewer than 2 peaks are
   detected in most years.
