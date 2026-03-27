@@ -12,8 +12,8 @@
 | Temporal coverage | January 2016 – June 2019 (~3.5 years) |
 | Temporal resolution | Irregular (1–3 day cadence; cloud/quality masking applied) |
 | Spatial resolution | 30 m (HLS Sentinel-2 and Landsat-8/9 tiles) |
-| VI variable | NDVI (Normalized Difference Vegetation Index) |
-| Valid range | −0.1 to 1.0 (values outside this range masked to NaN) |
+| VI variable | NDVI, EVI2, or NIRv — auto-detected from filename |
+| Valid range | Per-VI (NDVI: −0.1–1.0; EVI2: −1.0–2.0; NIRv: −0.5–1.0) |
 
 ### 1.2 File Format
 
@@ -36,19 +36,38 @@ For display in the Plotly heatmap, coordinates are reprojected to
 
 ---
 
-## 2. Vegetation Index
+## 2. Vegetation Indices
+
+The dashboard supports three vegetation indices, auto-detected from the datacube filename.
+All share the same Whittaker smoothing and 19-metric computation pipeline; only the
+valid observation range and axis labelling differ.
 
 ### 2.1 NDVI
-
-The Normalized Difference Vegetation Index (NDVI) is the primary variable:
 
 $$
 \text{NDVI} = \frac{\rho_\text{NIR} - \rho_\text{RED}}{\rho_\text{NIR} + \rho_\text{RED}}
 $$
 
-where ρ_NIR and ρ_RED are surface reflectance in the near-infrared and red bands,
-respectively.  NDVI ranges theoretically from −1 to 1; values above ~0.2 indicate
-photosynthetically active vegetation.
+Valid range: **−0.1 to 1.0**.  Values outside this range are masked to NaN.
+Values above ~0.2 indicate photosynthetically active vegetation.
+
+### 2.2 EVI2
+
+$$
+\text{EVI2} = 2.5 \cdot \frac{\rho_\text{NIR} - \rho_\text{RED}}{\rho_\text{NIR} + 2.4 \cdot \rho_\text{RED} + 1}
+$$
+
+A two-band Enhanced Vegetation Index that does not require a blue band.
+Valid range: **−1.0 to 2.0**.  Less sensitive to soil background in sparse canopies.
+
+### 2.3 NIRv
+
+$$
+\text{NIRv} = \text{NDVI} \times \rho_\text{NIR}
+$$
+
+Near-infrared reflectance of vegetation, proportional to the fraction of absorbed
+photosynthetically active radiation (fAPAR).  Valid range: **−0.5 to 1.0**.
 
 ---
 
@@ -275,20 +294,54 @@ in Shiny's reactive graph until the region or metric changes.
 The metric array is reprojected from the UTM grid onto a regular WGS84 grid
 (nearest-neighbour via `scipy.interpolate.RegularGridInterpolator`), then
 rendered as a PNG image overlay on an `ipyleaflet.Map`.  A satellite tile
-layer (default: ESRI World Imagery) is displayed underneath.  The tile service,
-overlay opacity, and colorscale clipping range (full / Mean ± N SD) are all
-adjustable in the sidebar without triggering a Dask recompute.
+layer (default: ESRI World Imagery) is displayed underneath.  The tile service, overlay opacity, and **Data range** clipping (full / Mean ± N SD)
+are all adjustable in the sidebar without triggering a Dask recompute.
+
+The Data range control also acts as an **analysis filter** (see §5.2.2).
 
 Pixel selection is handled by the `Map.on_interaction` callback: on a click event,
 the (lat, lon) coordinates from ipyleaflet are converted back to UTM and
 nearest-neighbour matched to an array index `(yi, xi)`.
+
+### 5.2.2 Data Range Filter
+
+The **Data range** sidebar control defines a VI sub-range [z_min, z_max].  It does
+two things simultaneously:
+
+1. **Colorbar clipping** — the colour ramp on the basemap overlay is stretched to
+   [z_min, z_max] so spatial variation within the range is maximally visible.
+
+2. **Observation filter** — all pixel-level analysis is restricted to observations
+   within the range.  This is implemented via a `narrowed_timeseries()` reactive
+   calculation that copies the `PixelTimeSeries` struct with a modified `valid_mask`:
+
+   ```
+   mask = original_valid_mask
+         & (raw_vi >= z_min)
+         & (raw_vi <= z_max)
+   ```
+
+   Every downstream reactive — Whittaker smoothing, all 19 phenological metrics,
+   the raw-VI scatter, the Annual Cycles overlay, and the Metric Trends plots —
+   reads from `narrowed_timeseries()` rather than the full pixel time series.
+
+The `pixel_metric_config()` reactive additionally clamps the per-VI physical valid
+range (from `VI_VALID_RANGE`) to [z_min, z_max], so metric-quality checks (e.g.,
+`min_valid_obs`) are evaluated against the filtered observation count.
+
+When no range is set, `narrowed_timeseries()` returns the original series unchanged
+and there is no performance penalty.
+
+The sidebar shows both the total valid observation count and the in-range count
+(e.g., "In range: 782 / 842 valid (93%)") so the effect of the filter is immediately
+visible.
 
 ### 5.3 Pixel Time Series Extraction
 
 Single-pixel reads use the netCDF4 library's direct HDF5 hyperslab API:
 
 ```python
-vi_arr = nc4_dataset.variables["NDVI"][:, yi, xi]
+vi_arr = nc4_dataset.variables[vi_var][:, yi, xi]  # vi_var = "NDVI", "EVI2", or "NIRv"
 ```
 
 This is a 3-element index that the HDF5 library translates to a single hyperslab
@@ -351,12 +404,14 @@ After a pixel is selected, three panels are available:
 
 | Tab | Content |
 |---|---|
-| Raw NDVI | Raw observations (grey scatter) + Whittaker-smoothed daily curve (green line) over the full date range |
+| Raw VI | Raw observations (grey scatter) + Whittaker-smoothed daily curve (green line) over the full date range |
 | Annual Cycles | Per-calendar-year DOY overlay: each year's smoothed curve plotted on a 1–366 axis, with a black cross-year mean trace |
 | Metric Trends | Per-year scatter for each of the 11 trackable metrics, with a dashed mean line and grey ± std band |
 
-All three panels update when λ changes, as they share the same `smoothed_result`
-and `pixel_annual_data` reactive calculations.
+All three panels update when λ changes or the Data range filter changes, as they
+all share `narrowed_timeseries()` → `smoothed_result` → `pixel_annual_data` in the
+reactive graph.  The y-axis bounds and label are set dynamically from `VI_VALID_RANGE`
+for the current region's VI type.
 
 ---
 
@@ -365,6 +420,10 @@ and `pixel_annual_data` reactive calculations.
 - **Cloud masking** — Quality-masked pixels appear as NaN.  Pixels with fewer
   than 20 valid observations (`min_valid_obs`) across the full time series produce
   `NaN` for all metrics.
+- **Data range filter** — Setting a Data range further reduces the observation
+  pool.  If the filtered count falls below `min_valid_obs`, all metrics show N/A
+  for that pixel.  The sidebar shows both the full valid count and the in-range
+  count to make this visible.
 - **Bimodality metrics** — `peak_separation_mean`, `relative_peak_amplitude_mean`,
   and `valley_depth_mean` are `NaN` for pixels where fewer than 2 peaks are
   detected in most years.

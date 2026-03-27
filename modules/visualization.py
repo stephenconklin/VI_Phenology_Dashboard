@@ -24,7 +24,7 @@ from PIL import Image as PILImage
 import pandas as pd
 from plotly.subplots import make_subplots as _make_subplots
 
-from config import METRIC_LABELS, METRIC_GROUPS
+from config import METRIC_LABELS, METRIC_GROUPS, VI_VALID_RANGE
 
 
 class SatelliteImage(NamedTuple):
@@ -608,6 +608,7 @@ def make_timeseries_figure(
     smoothed_daily: np.ndarray,     # (n_days,) smoothed on daily grid
     daily_dates: np.ndarray,        # datetime64[D] (n_days,)
     region_id: str,
+    vi_var: str = "NDVI",
     basemap_metric: str | None = None,
     zmin: float | None = None,
     zmax: float | None = None,
@@ -636,7 +637,7 @@ def make_timeseries_figure(
         mode="markers",
         marker=dict(color="#888888", size=4, opacity=0.65),
         name="Raw observations",
-        hovertemplate="Date: %{x}<br>NDVI: %{y:.4f}<extra></extra>",
+        hovertemplate=f"Date: %{{x}}<br>{vi_var}: %{{y:.4f}}<extra></extra>",
     )
 
     smooth_trace = go.Scatter(
@@ -645,7 +646,7 @@ def make_timeseries_figure(
         mode="lines",
         line=dict(color="#2ca02c", width=2),
         name="Whittaker smoothed",
-        hovertemplate="Date: %{x}<br>NDVI: %{y:.4f}<extra></extra>",
+        hovertemplate=f"Date: %{{x}}<br>{vi_var}: %{{y:.4f}}<extra></extra>",
         connectgaps=False,
     )
 
@@ -660,8 +661,9 @@ def make_timeseries_figure(
     if (basemap_metric and _ndvi_compatible(basemap_metric)
             and zmin is not None and zmax is not None):
         cmap = matplotlib.colormaps[_mpl_cmap_for(basemap_metric)]
-        for level, cmap_t, label in [(zmin, 0.0, "map min"), (zmax, 1.0, "map max")]:
-            if -0.2 <= level <= 1.1:
+        _vi_lo, _vi_hi = VI_VALID_RANGE.get(vi_var, (-0.2, 1.1))
+        for level, cmap_t, label in [(zmin, 0.0, "range min"), (zmax, 1.0, "range max")]:
+            if _vi_lo - 0.1 <= level <= _vi_hi + 0.1:
                 r, g, b, _ = cmap(cmap_t)
                 line_color = f"rgb({int(r*255)},{int(g*255)},{int(b*255)})"
                 shapes.append(dict(
@@ -685,8 +687,11 @@ def make_timeseries_figure(
             ),
             xaxis=dict(title="Date", showgrid=True, gridcolor="#e0e0e0"),
             yaxis=dict(
-                title="NDVI",
-                range=[-0.15, 1.05],
+                title=vi_var,
+                range=[
+                    VI_VALID_RANGE.get(vi_var, (-0.15, 1.05))[0] - 0.05,
+                    VI_VALID_RANGE.get(vi_var, (-0.15, 1.05))[1] + 0.05,
+                ],
                 showgrid=True,
                 gridcolor="#e0e0e0",
             ),
@@ -795,6 +800,7 @@ def make_annual_cycle_figure(
     smoothed: np.ndarray,
     daily_dates: np.ndarray,
     region_id: str,
+    vi_var: str = "NDVI",
     basemap_metric: str | None = None,
     zmin: float | None = None,
     zmax: float | None = None,
@@ -859,10 +865,11 @@ def make_annual_cycle_figure(
             and zmin is not None and zmax is not None):
         cmap = matplotlib.colormaps[_mpl_cmap_for(basemap_metric)]
         for level, t, lbl in [
-            (zmin, 0.0, f"map min: {zmin:.3f}"),
-            (zmax, 1.0, f"map max: {zmax:.3f}"),
+            (zmin, 0.0, f"range min: {zmin:.3f}"),
+            (zmax, 1.0, f"range max: {zmax:.3f}"),
         ]:
-            if -0.2 <= level <= 1.1:
+            _vi_lo, _vi_hi = VI_VALID_RANGE.get(vi_var, (-0.2, 1.1))
+            if _vi_lo - 0.1 <= level <= _vi_hi + 0.1:
                 r, g, b, _ = cmap(t)
                 col = f"rgb({int(r*255)},{int(g*255)},{int(b*255)})"
                 shapes.append(dict(
@@ -876,11 +883,18 @@ def make_annual_cycle_figure(
     return go.FigureWidget(
         data=traces,
         layout=go.Layout(
-            title=dict(text=f"{region_id} — Annual NDVI Cycles", font=dict(size=13)),
+            title=dict(text=f"{region_id} — Annual {vi_var} Cycles", font=dict(size=13)),
             xaxis=dict(title="Day of Year", showgrid=True, gridcolor="#e0e0e0",
                        range=[1, 366]),
-            yaxis=dict(title="NDVI", range=[-0.15, 1.05], showgrid=True,
-                       gridcolor="#e0e0e0"),
+            yaxis=dict(
+                title=vi_var,
+                range=[
+                    VI_VALID_RANGE.get(vi_var, (-0.15, 1.05))[0] - 0.05,
+                    VI_VALID_RANGE.get(vi_var, (-0.15, 1.05))[1] + 0.05,
+                ],
+                showgrid=True,
+                gridcolor="#e0e0e0",
+            ),
             shapes=shapes,
             legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0,
                         font=dict(size=10)),

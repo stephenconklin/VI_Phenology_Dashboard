@@ -37,6 +37,7 @@ from config import (
     METRIC_GROUPS,
     METRIC_LABELS,
     PIXEL_METRIC_CONFIG,
+    VI_VALID_RANGE,
 )
 from modules.datacube_io import (
     PixelTimeSeries,
@@ -107,7 +108,7 @@ _BASEMAP_CHOICES: dict[str, dict[str, str]] = {
         if key in METRIC_LABELS
     },
 }
-_DEFAULT_BASEMAP_KEY: str = list(FAST_BASEMAP_METRICS.values())[0]  # "peak_ndvi_mean"
+_DEFAULT_BASEMAP_KEY: str = FAST_BASEMAP_METRICS["Mean VI"]  # "mean_ndvi"
 
 
 # ---------------------------------------------------------------------------
@@ -160,14 +161,14 @@ app_ui = ui.page_sidebar(
         ),
         ui.input_select(
             id="colorscale_range",
-            label="Color scale range",
+            label="Data range",
             choices={
                 "full": "Full range (min – max)",
                 "3sd":  "Mean ± 3 SD  (~99.7 %)",
                 "2sd":  "Mean ± 2 SD  (~95 %)",
                 "1sd":  "Mean ± 1 SD  (~68 %)",
             },
-            selected="2sd",
+            selected="3sd",
         ),
         ui.output_ui("colorbar_panel"),
 
@@ -209,16 +210,19 @@ app_ui = ui.page_sidebar(
             overflow: auto !important;
             min-height: 280px;
         }
-        /* Subtle drag-handle hint at the bottom of the map card */
+        /* Resize hint — right-aligned to match the native corner gripper */
         .vipd-map-card::after {
-            content: "";
+            content: "drag corner to resize ↘";
             display: block;
-            height: 4px;
-            margin: 4px auto 0;
-            width: 48px;
-            border-radius: 2px;
-            background: #c0c8c0;
-            cursor: ns-resize;
+            text-align: right;
+            padding-right: 20px;
+            height: 16px;
+            line-height: 16px;
+            font-size: 10px;
+            color: #9aaa9a;
+            background: #eef3ee;
+            border-top: 1px solid #ccdacc;
+            user-select: none;
         }
         /* Card bodies fill available height */
         .vipd-map-card .card-body,
@@ -293,7 +297,7 @@ app_ui = ui.page_sidebar(
     ),
     ui.navset_card_tab(
         ui.nav_panel(
-            "Raw NDVI",
+            "Raw VI",
             output_widget("timeseries_widget"),
         ),
         ui.nav_panel(
@@ -308,7 +312,7 @@ app_ui = ui.page_sidebar(
             ),
         ),
         id="ts_tabs",
-        selected="Raw NDVI",
+        selected="Raw VI",
         full_screen=True,
     ),
 
@@ -400,18 +404,17 @@ def server(input: Inputs, output: Outputs, session: Session):
         # On-the-fly fast metrics (always available)
         _fast_keys = set(FAST_BASEMAP_METRICS.values())
         if metric in _fast_keys:
-            return compute_basemap_metric(ds, metric)
+            return compute_basemap_metric(ds, metric, vi_var=paths.vi_var)
 
         # Phenology metric requested but no precomputed file
         ui.notification_show(
             f"No precomputed pixel_metrics.nc found for region "
-            f"'{input.region()}'. Showing Peak NDVI instead. "
-            "Run tools/convert_to_zarr.py then pixel_phenology_extract.py "
-            "to generate pixel_metrics.nc.",
+            f"'{input.region()}'. Showing Peak {paths.vi_var} instead. "
+            "Run tools/pixel_phenology_extract.py to generate pixel_metrics.nc.",
             type="warning",
             duration=10,
         )
-        return compute_basemap_metric(ds, "peak_ndvi_mean")
+        return compute_basemap_metric(ds, "peak_ndvi_mean", vi_var=paths.vi_var)
 
     @reactive.Calc
     def colorscale_limits() -> tuple[float | None, float | None]:
@@ -442,35 +445,84 @@ def server(input: Inputs, output: Outputs, session: Session):
         yi, xi = idx
         paths = region_paths()
         try:
-            return extract_pixel_timeseries(paths.nc_path, yi, xi)
+            return extract_pixel_timeseries(paths.nc_path, yi, xi, vi_var=paths.vi_var)
         except Exception as exc:
             ui.notification_show(f"Pixel read error: {exc}", type="error", duration=6)
             return None
 
     @reactive.Calc
+    def narrowed_timeseries() -> PixelTimeSeries | None:
+        """
+        PixelTimeSeries with valid_mask restricted to observations that fall
+        within the active data range (colorscale_limits).  All smoothing and
+        metric computation uses this rather than the full physical series, so
+        that the Data Range control genuinely filters the analysis.
+
+        When the range is "full" (zmin/zmax both None), returns the original
+        pixel_timeseries unchanged.
+        """
+        ts = pixel_timeseries()
+        if ts is None:
+            return None
+        zmin, zmax = colorscale_limits()
+        if zmin is None and zmax is None:
+            return ts
+        mask = ts.valid_mask.copy()
+        if zmin is not None:
+            mask &= ts.raw_vi >= float(zmin)
+        if zmax is not None:
+            mask &= ts.raw_vi <= float(zmax)
+        return PixelTimeSeries(
+            dates=ts.dates,
+            raw_vi=ts.raw_vi,
+            valid_mask=mask,
+            x_coord=ts.x_coord,
+            y_coord=ts.y_coord,
+            lon=ts.lon,
+            lat=ts.lat,
+        )
+
+    @reactive.Calc
     def smoothed_result() -> tuple[np.ndarray, np.ndarray] | None:
         """
         Whittaker-smoothed daily time series + daily date array.
-        Triggered by: pixel_timeseries OR lambda_val change.
+        Triggered by: narrowed_timeseries OR lambda_val change.
         """
-        ts = pixel_timeseries()
+        ts = narrowed_timeseries()
         if ts is None:
             return None
         dc = dataset_date_cache()
         return smooth_pixel(ts, dc, float(input.lambda_val()))
 
     @reactive.Calc
+    def pixel_metric_config() -> dict:
+        """
+        Per-region metric config with vi_min/vi_max clamped to both the
+        physical VI valid range and the active data range (colorscale_limits).
+        Ensures observation masking and curve clipping inside the Whittaker
+        smoother match the data range filter applied to the time series.
+        """
+        vi = region_paths().vi_var
+        vi_min, vi_max = VI_VALID_RANGE.get(vi, VI_VALID_RANGE[DEFAULT_VI_VAR])
+        zmin, zmax = colorscale_limits()
+        if zmin is not None:
+            vi_min = max(vi_min, float(zmin))
+        if zmax is not None:
+            vi_max = min(vi_max, float(zmax))
+        return {**PIXEL_METRIC_CONFIG, "vi_min": vi_min, "vi_max": vi_max}
+
+    @reactive.Calc
     def pixel_annual_data():
         """
         Full annual breakdown: (metrics, valid_years, annual_data).
-        Triggered by: pixel_timeseries OR lambda_val change.
+        Triggered by: narrowed_timeseries, lambda_val, or data range change.
         """
-        ts = pixel_timeseries()
+        ts = narrowed_timeseries()
         if ts is None:
             return None
         dc = dataset_date_cache()
         return compute_pixel_with_annual(
-            ts, dc, float(input.lambda_val()), PIXEL_METRIC_CONFIG
+            ts, dc, float(input.lambda_val()), pixel_metric_config()
         )
 
     @reactive.Calc
@@ -594,7 +646,7 @@ def server(input: Inputs, output: Outputs, session: Session):
 
     @render_widget
     def timeseries_widget():
-        ts = pixel_timeseries()
+        ts = narrowed_timeseries()
         if ts is None:
             return make_empty_timeseries_figure()
 
@@ -609,6 +661,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             smoothed_daily=smoothed_daily,
             daily_dates=daily_dates,
             region_id=input.region(),
+            vi_var=region_paths().vi_var,
             basemap_metric=basemap_metric_key(),
             zmin=zmin,
             zmax=zmax,
@@ -626,6 +679,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             smoothed=smoothed_daily,
             daily_dates=daily_dates,
             region_id=input.region(),
+            vi_var=region_paths().vi_var,
             basemap_metric=basemap_metric_key(),
             zmin=zmin,
             zmax=zmax,
@@ -664,26 +718,38 @@ def server(input: Inputs, output: Outputs, session: Session):
         lon, lat = coords
         yi, xi   = idx
 
-        # Pull observation stats from the pixel time series if available
-        ts = pixel_timeseries()
-        if ts is not None:
-            n_valid = int(ts.valid_mask.sum())
-            n_total = len(ts.valid_mask)
-            pct     = 100.0 * n_valid / n_total if n_total > 0 else 0.0
-            valid_dates = ts.dates[ts.valid_mask]
-            date_first  = str(valid_dates.min())[:10] if n_valid > 0 else "—"
-            date_last   = str(valid_dates.max())[:10] if n_valid > 0 else "—"
-            vi_min = float(ts.raw_vi[ts.valid_mask].min()) if n_valid > 0 else float("nan")
-            vi_max = float(ts.raw_vi[ts.valid_mask].max()) if n_valid > 0 else float("nan")
+        # Pull observation stats from both full and narrowed time series
+        ts_full = pixel_timeseries()
+        ts_nr   = narrowed_timeseries()
+        if ts_full is not None and ts_nr is not None:
+            n_total   = len(ts_full.valid_mask)
+            n_valid   = int(ts_full.valid_mask.sum())
+            n_in_range = int(ts_nr.valid_mask.sum())
+            pct_valid = 100.0 * n_valid   / n_total if n_total  > 0 else 0.0
+            pct_range = 100.0 * n_in_range / n_valid if n_valid > 0 else 0.0
+            valid_dates = ts_nr.dates[ts_nr.valid_mask]
+            date_first  = str(valid_dates.min())[:10] if n_in_range > 0 else "—"
+            date_last   = str(valid_dates.max())[:10] if n_in_range > 0 else "—"
+            vi_rng = ts_nr.raw_vi[ts_nr.valid_mask]
+            vi_lo  = float(vi_rng.min()) if n_in_range > 0 else float("nan")
+            vi_hi  = float(vi_rng.max()) if n_in_range > 0 else float("nan")
+
+            range_line = (
+                ui.tags.b("In range: "),
+                f"{n_in_range} / {n_valid} valid  ({pct_range:.1f}%)",
+                ui.tags.br(),
+            ) if n_in_range != n_valid else ()
+
             obs_block = ui.tags.small(
                 ui.tags.b("Valid obs: "),
-                f"{n_valid} / {n_total}  ({pct:.1f}%)",
+                f"{n_valid} / {n_total}  ({pct_valid:.1f}%)",
                 ui.tags.br(),
+                *range_line,
                 ui.tags.b("Date range: "),
                 f"{date_first} → {date_last}",
                 ui.tags.br(),
-                ui.tags.b("NDVI range: "),
-                f"{vi_min:.3f} – {vi_max:.3f}",
+                ui.tags.b(f"{region_paths().vi_var} range: "),
+                f"{vi_lo:.3f} – {vi_hi:.3f}",
                 style="color:#444",
             )
         else:

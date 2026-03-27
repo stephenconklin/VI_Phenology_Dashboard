@@ -28,7 +28,6 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
     DATACUBE_ROOT,
-    FLIGHT_BOX_SUBDIR,
     DEFAULT_VI_VAR,
     DATACUBE_CRS_EPSG,
     TARGET_CRS_EPSG,
@@ -43,11 +42,12 @@ from config import (
 
 @dataclass
 class RegionPaths:
-    """Paths for one LVIS flight box region."""
+    """Paths and VI variable name for one datacube region."""
     region_id: str
     nc_path: Path
     zarr_path: Path | None      # None if not yet converted
     metrics_path: Path | None   # None if pixel_metrics.nc not present
+    vi_var: str = DEFAULT_VI_VAR
 
 
 class PixelTimeSeries(NamedTuple):
@@ -65,44 +65,104 @@ class PixelTimeSeries(NamedTuple):
 # Region discovery
 # ---------------------------------------------------------------------------
 
+def _parse_nc_stem(stem: str) -> tuple[str, str]:
+    """
+    Extract (region_id, vi_var) from a NetCDF filename stem.
+
+    Handles two common naming conventions (and anything in between):
+
+        T34HDG_NDVI          →  ("T34HDG", "NDVI")   — trailing VI suffix
+        NDVI_G5_1_datacube   →  ("G5_1",   "NDVI")   — leading VI prefix
+        SomeName_datacube    →  ("SomeName", DEFAULT_VI_VAR)
+        Anything             →  (stem,      DEFAULT_VI_VAR)
+
+    Known VI names are taken from VI_VALID_RANGE in config.py.
+    The optional "_datacube" suffix is stripped before matching.
+    """
+    known_vis: tuple[str, ...] = tuple(VI_VALID_RANGE.keys())
+
+    # Strip optional "_datacube" suffix
+    base = stem[: -len("_datacube")] if stem.endswith("_datacube") else stem
+
+    # Trailing _{VI} suffix  (e.g. T34HDG_NDVI)
+    for vi in known_vis:
+        if base.endswith(f"_{vi}"):
+            return base[: -len(f"_{vi}")], vi
+
+    # Leading {VI}_ prefix  (e.g. NDVI_G5_1)
+    for vi in known_vis:
+        if base.startswith(f"{vi}_"):
+            return base[len(f"{vi}_") :], vi
+
+    # No VI found in name
+    return base, DEFAULT_VI_VAR
+
+
 def discover_regions(root: Path = DATACUBE_ROOT) -> dict[str, RegionPaths]:
     """
-    Scan DATACUBE_ROOT/LVIS_flightboxes_final/ for all G5_xx subdirectories.
+    Recursively scan DATACUBE_ROOT for NetCDF datacubes (*.nc).
 
-    For each region, checks for:
-        {VI}_{region}_datacube.nc          (required)
-        {VI}_{region}_datacube.zarr/       (optional — fast path)
-        {VI}_{region}_pixel_metrics.nc     (optional — precomputed metrics)
+    No assumptions are made about subdirectory names, nesting depth,
+    or filename conventions.  For each datacube found:
 
-    Returns a dict keyed by region_id (e.g. "G5_1") sorted naturally.
-    Raises FileNotFoundError if the root directory does not exist.
+    - Region ID and VI variable are parsed from the filename stem via
+      _parse_nc_stem().  Examples:
+          T34HDG_NDVI.nc         →  region "T34HDG",  vi "NDVI"
+          NDVI_G5_1_datacube.nc  →  region "G5_1",    vi "NDVI"
+    - Files whose stem contains "pixel_metrics" are skipped (those are
+      companion output files, not input datacubes).
+    - Companion files are looked up in the same directory as the .nc:
+          <nc_stem>.zarr/                  (optional — fast pixel reads)
+          <nc_stem>_pixel_metrics.nc       (optional — precomputed metrics)
+    - If two files in different directories produce the same region ID,
+      the parent directory name is prepended ("parent/region").
+
+    Returns a dict keyed by region_id, sorted naturally.
+    Raises FileNotFoundError if root does not exist or no datacubes are found.
     """
-    flight_dir = root / FLIGHT_BOX_SUBDIR
-    if not flight_dir.exists():
+    if not root.exists():
         raise FileNotFoundError(
-            f"Datacube directory not found: {flight_dir}\n"
+            f"Datacube directory not found: {root}\n"
             f"Set VI_DATACUBE_ROOT env var or edit config.py."
         )
 
-    vi = DEFAULT_VI_VAR
+    nc_files = sorted(
+        (p for p in root.rglob("*.nc") if "pixel_metrics" not in p.stem),
+        key=lambda p: _natural_sort_key(p.name),
+    )
+
+    if not nc_files:
+        raise FileNotFoundError(
+            f"No *.nc datacube files found under: {root}\n"
+            f"Set VI_DATACUBE_ROOT env var or edit config.py."
+        )
+
+    # First pass: parse candidate region IDs and VI variable names
+    candidates: list[tuple[str, str, Path]] = []
+    for nc_path in nc_files:
+        region_id, vi_var = _parse_nc_stem(nc_path.stem)
+        candidates.append((region_id, vi_var, nc_path))
+
+    # Detect collisions and qualify with parent directory name
+    seen: dict[str, int] = {}
+    for rid, _, _ in candidates:
+        seen[rid] = seen.get(rid, 0) + 1
+
     regions: dict[str, RegionPaths] = {}
+    for region_id, vi_var, nc_path in candidates:
+        if seen[region_id] > 1:
+            region_id = f"{nc_path.parent.name}/{region_id}"
 
-    for subdir in sorted(flight_dir.iterdir(), key=lambda p: _natural_sort_key(p.name)):
-        if not subdir.is_dir() or not subdir.name.startswith("G5_"):
-            continue
-        region_id = subdir.name
-        nc_path = subdir / f"{vi}_{region_id}_datacube.nc"
-        if not nc_path.exists():
-            continue
-
-        zarr_path  = subdir / f"{vi}_{region_id}_datacube.zarr"
-        metrics_path = subdir / f"{vi}_{region_id}_pixel_metrics.nc"
+        parent = nc_path.parent
+        zarr_path    = parent / (nc_path.stem + ".zarr")
+        metrics_path = parent / (nc_path.stem + "_pixel_metrics.nc")
 
         regions[region_id] = RegionPaths(
             region_id=region_id,
             nc_path=nc_path,
             zarr_path=zarr_path if zarr_path.exists() else None,
             metrics_path=metrics_path if metrics_path.exists() else None,
+            vi_var=vi_var,
         )
 
     return regions
@@ -492,7 +552,7 @@ def extract_pixel_timeseries(
         y_val = float(ds.variables["y"][yi])
 
     # Apply valid-range mask
-    vi_min, vi_max = VI_VALID_RANGE.get(vi_var, (-1.0, 2.0))
+    vi_min, vi_max = VI_VALID_RANGE.get(vi_var, (-1.0, 2.0))  # fallback = widest known range (EVI2)
     valid_mask = (
         ~np.isnan(vi_arr)
         & (vi_arr >= vi_min)

@@ -18,10 +18,9 @@ DATACUBE_ROOT: Path = Path(
     os.environ.get(
         "VI_DATACUBE_ROOT",
         "/Volumes/ConklinGeospatialData/Data/BioSCape_SA_LVIS/VI_Phenology/netcdf_datacube",
+        # "/Volumes/ConklinGeospatialData/Data/BioSCape_SA_LVIS/2_Interim/2_NetCDF"
     )
 )
-
-FLIGHT_BOX_SUBDIR = "LVIS_flightboxes_final"
 
 # ---------------------------------------------------------------------------
 # Spatial / coordinate reference
@@ -66,9 +65,9 @@ BASEMAP_MAX_DIM: int = 500
 # Fast basemap metrics always available (no precomputed file required).
 # Keys are the internal metric IDs used in compute_basemap_metric().
 FAST_BASEMAP_METRICS: dict[str, str] = {
-    "Peak NDVI": "peak_ndvi_mean",
-    "Mean NDVI": "mean_ndvi",
-    "Std Dev NDVI": "std_ndvi",
+    "Peak VI": "peak_ndvi_mean",
+    "Mean VI": "mean_ndvi",
+    "Std Dev VI": "std_ndvi",
     "Data Coverage": "data_coverage",
 }
 

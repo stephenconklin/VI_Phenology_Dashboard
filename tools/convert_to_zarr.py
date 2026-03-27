@@ -59,7 +59,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import xarray as xr
 
-from config import DEFAULT_VI_VAR
 from modules.datacube_io import discover_regions, RegionPaths
 
 
@@ -83,8 +82,7 @@ def convert_region(
     chunk_x  : spatial chunk size along the x axis
     dry_run  : if True, print what would happen but don't write
     """
-    vi = DEFAULT_VI_VAR
-    zarr_path = paths.nc_path.parent / f"{vi}_{paths.region_id}_datacube.zarr"
+    zarr_path = paths.nc_path.parent / (paths.nc_path.stem + ".zarr")
 
     if zarr_path.exists():
         print(f"[{paths.region_id}] ZARR already exists — skipping: {zarr_path}")

@@ -16,10 +16,11 @@ compute and visualise its full Whittaker-smoothed phenology time series plus
 
 | Feature | Description |
 |---|---|
-| Region selector | Dropdown of all G5_xx LVIS flight box regions |
-| Spatial basemap | Plotly heatmap of peak NDVI or other spatial metrics |
+| Region selector | Dropdown of all discovered regions; supports NDVI, EVI2, NIRv datacubes |
+| Spatial basemap | ipyleaflet map with metric colour overlay on satellite imagery |
 | Click-to-select | Click any pixel on the map to load its time series |
-| Time series plot | Raw NDVI observations + Whittaker-smoothed curve |
+| Time series plot | Raw VI observations + Whittaker-smoothed curve (3 tabs) |
+| Data range filter | Restrict the analysis to a VI sub-range — affects all plots and metrics |
 | Lambda slider | Adjust smoothing (λ = 10–1000) and see results update live |
 | 19-metric sidebar | All phenological metrics for the selected pixel, grouped by category |
 | ZARR acceleration | Optional one-time rechunking for fast pixel reads on large files |
@@ -76,21 +77,33 @@ shiny run app.py --reload
 
 ## Data Directory Layout
 
-The dashboard expects this structure under `DATACUBE_ROOT`:
+The dashboard recursively scans `DATACUBE_ROOT` for **any `*.nc` file** at any
+depth (excluding `*pixel_metrics.nc`).  No specific subdirectory structure is required.
+
+Two filename conventions are supported automatically:
+
+| Convention | Example | Region ID | VI |
+|---|---|---|---|
+| Leading VI prefix | `NDVI_G5_1_datacube.nc` | `G5_1` | NDVI |
+| Trailing VI suffix | `T34HDG_NDVI.nc` | `T34HDG` | NDVI |
+| EVI2 trailing suffix | `T34HDG_EVI2.nc` | `T34HDG` | EVI2 |
 
 ```
-netcdf_datacube/
-└── LVIS_flightboxes_final/
-    ├── G5_1/
-    │   ├── NDVI_G5_1_datacube.nc          ← required
-    │   ├── NDVI_G5_1_datacube.zarr/       ← optional (fast pixel reads)
-    │   └── NDVI_G5_1_pixel_metrics.nc     ← optional (fast basemap display)
-    ├── G5_2/
-    │   └── NDVI_G5_2_datacube.nc
-    ...
-    └── G5_25/
-        └── NDVI_G5_25_datacube.nc
+DATACUBE_ROOT/
+├── G5_1/
+│   ├── NDVI_G5_1_datacube.nc          ← required
+│   ├── NDVI_G5_1_datacube.zarr/       ← optional (fast pixel reads)
+│   └── NDVI_G5_1_datacube_pixel_metrics.nc  ← optional (fast basemap)
+├── tiles/
+│   ├── T34HDG_NDVI.nc                 ← also discovered
+│   ├── T34HDG_EVI2.nc                 ← separate region entry
+│   └── T34HDG_NDVI.zarr/              ← zarr named from nc stem
+...
 ```
+
+**Region ID derivation** — derived from the filename stem with the VI token
+and `_datacube` suffix stripped.  If two files in different directories produce
+the same ID, the parent directory name is prepended (`parent/region`).
 
 The dashboard discovers all regions automatically at startup.
 
@@ -104,15 +117,16 @@ The dashboard discovers all regions automatically at startup.
 │  Basemap    [Peak NDVI ▼]   │  │  │  Satellite basemap + metric colour overlay        │ │
 │  Basemap style [Imagery ▼]  │  │  │  Click any pixel → red marker + time series load  │ │
 │  Metric opacity [─●──]      │  │  └─────────────────────────────────────────────────┘ │
-│  Color scale [Mean±2SD ▼]   │  │                                                       │
+│  Data range  [Mean±2SD ▼]   │  │                                                       │
 │  [colorbar]                 │  │  ┌─ Tabs ──────────────────────────────────────────┐  │
-│  λ smoothing [────●────]    │  │  │  Raw NDVI │ Annual Cycles │ Metric Trends        │  │
+│  λ smoothing [────●────]    │  │  │  Raw VI   │ Annual Cycles │ Metric Trends        │  │
 │  10          500       1000 │  │  │  ─────────────────────────────────────────────  │  │
 │  ─────────────────────────  │  │  │  Raw obs (grey) + Whittaker-smooth (green)       │  │
 │  Selected pixel             │  │  │    OR  per-DOY curves by year                   │  │
 │  Lat -33.4821°              │  │  │    OR  per-year metric scatter + mean ± std      │  │
 │  Lon  19.2341°              │  │  └─────────────────────────────────────────────────┘  │
 │  Valid obs: 842/1287 (65%)  │  │                                                       │
+│  In range: 782/842 (93%)    │  │                                                       │
 │  Date range: 2016-01 →      │  │                                                       │
 │  NDVI range: 0.11 – 0.94    │  │                                                       │
 │  ─────────────────────────  │  │                                                       │
@@ -133,13 +147,14 @@ The dashboard discovers all regions automatically at startup.
 ## Workflow
 
 1. **Select a region** from the dropdown — the basemap metric overlay loads (2–20 s for large files).
-2. **Choose a basemap metric** to recolour the overlay (e.g., Peak NDVI, Season Length).
+2. **Choose a basemap metric** to recolour the overlay (e.g., Peak VI, Season Length).
 3. **Choose a basemap style** (satellite imagery, OpenStreetMap, etc.) and adjust **opacity**.
 4. **Click any pixel** on the map — a red marker appears and the time series loads.
 5. **Adjust the lambda slider** to change Whittaker smoothing — the curve and all 19 metrics update instantly.
-6. The **19 phenological metrics** appear in the sidebar, grouped by category.
-7. Switch between **three time-series tabs**:
-   - **Raw NDVI** — raw observations + Whittaker-smoothed curve, full date range
+6. Optionally set a **Data range** (VI sub-range) — only observations within the range are used for smoothing, all plots, and all 19 metrics.  The sidebar shows both the total valid observation count and the in-range count.
+7. The **19 phenological metrics** appear in the sidebar, grouped by category.
+8. Switch between **three time-series tabs**:
+   - **Raw VI** — raw observations + Whittaker-smoothed curve, full date range
    - **Annual Cycles** — per-DOY overlay by calendar year (seasonal shape comparison)
    - **Metric Trends** — annual scatter plots for each metric with mean ± std bands
 
@@ -151,9 +166,9 @@ These four "quick" metrics are always computed on-the-fly via Dask (no extra fil
 
 | Dropdown label | Description |
 |---|---|
-| Peak NDVI | Maximum NDVI value across all observations |
-| Mean NDVI | Temporal mean across all valid observations |
-| Std Dev NDVI | Temporal standard deviation |
+| Peak VI | Maximum VI value across all observations |
+| Mean VI | Temporal mean across all valid observations |
+| Std Dev VI | Temporal standard deviation |
 | Data Coverage | Fraction of timesteps with valid (non-NaN) observations |
 
 If a precomputed `pixel_metrics.nc` file exists alongside the datacube (generated by
@@ -166,7 +181,7 @@ available as basemap options too.
 |---|---|
 | Basemap style | Tile service: World Imagery (default), OpenStreetMap, Topo, Light Gray |
 | Metric layer opacity | 0–1 slider controlling transparency of the colour overlay |
-| Color scale range | Clip colorbar to full range, Mean ± 1/2/3 SD |
+| Data range | Clip colorbar to full range, Mean ± 1/2/3 SD; **also filters the VI observations used for all pixel-level analysis** (smoothing, metrics, all three time-series tabs) |
 
 ---
 
@@ -201,7 +216,8 @@ python tools/convert_to_zarr.py --all
 python tools/convert_to_zarr.py --all --dry-run
 ```
 
-ZARR stores appear as `NDVI_G5_xx_datacube.zarr/` directories next to the `.nc` files.
+ZARR stores are named after the source `.nc` stem (e.g., `NDVI_G5_14_datacube.zarr/`,
+`T34HDG_NDVI.zarr/`) and placed in the same directory as the `.nc` file.
 Disk space: expect ~1–1.5× the NC file size per ZARR store.
 
 ---
@@ -210,27 +226,45 @@ Disk space: expect ~1–1.5× the NC file size per ZARR store.
 
 See [docs/methods.md](docs/methods.md) for full mathematical definitions.
 
+The metric names below use `ndvi` in the variable name for historical reasons;
+the underlying computation works identically for any VI (NDVI, EVI2, NIRv).
+
 | Group | Metric | Description |
 |---|---|---|
-| **Peak** | peak_ndvi_mean | Mean annual peak NDVI across years |
-| | peak_ndvi_std | Interannual std of peak NDVI |
-| | peak_doy_mean | Mean day-of-year of peak NDVI |
+| **Peak** | peak_ndvi_mean | Mean annual peak VI across years |
+| | peak_ndvi_std | Interannual std of peak VI |
+| | peak_doy_mean | Mean day-of-year of peak VI |
 | | peak_doy_std | Interannual std of peak DOY |
-| **Productivity** | integrated_ndvi_mean | Mean integrated NDVI (area under curve) |
-| | integrated_ndvi_std | Interannual std of integrated NDVI |
+| **Productivity** | integrated_ndvi_mean | Mean integrated VI (area under curve) |
+| | integrated_ndvi_std | Interannual std of integrated VI |
 | | greenup_rate_mean | Mean green-up slope (floor → peak) |
 | | greenup_rate_std | Interannual std of green-up rate |
-| **Seasonality** | floor_ndvi_mean | Mean dry-season NDVI floor |
-| | ceiling_ndvi_mean | Mean wet-season NDVI ceiling |
+| **Seasonality** | floor_ndvi_mean | Mean dry-season VI floor |
+| | ceiling_ndvi_mean | Mean wet-season VI ceiling |
 | | season_length_mean | Mean days above phenological threshold |
 | | season_length_std | Interannual std of season length |
 | **Variability** | cv | Coefficient of variation (whole series) |
-| | interannual_peak_range | Max − min peak NDVI across years |
-| | interannual_peak_std | Std of annual peak NDVI across years |
+| | interannual_peak_range | Max − min peak VI across years |
+| | interannual_peak_std | Std of annual peak VI across years |
 | **Bimodality** | n_peaks_mean | Mean number of seasonal peaks per year |
 | | peak_separation_mean | Mean day-gap between the two highest peaks |
 | | relative_peak_amplitude_mean | Mean amplitude ratio of lower to higher peak |
 | | valley_depth_mean | Mean normalised depth of inter-peak valley |
+
+---
+
+## Supported Vegetation Indices
+
+The dashboard auto-detects the VI type from the datacube filename and applies
+the correct valid range throughout (colorbar, smoothing, y-axis bounds, metric computation).
+
+| VI | Valid range | Notes |
+|---|---|---|
+| NDVI | −0.1 to 1.0 | Default; values outside this range masked |
+| EVI2 | −1.0 to 2.0 | Enhanced VI 2 (two-band); wider valid range |
+| NIRv | −0.5 to 1.0 | Near-infrared reflectance of vegetation |
+
+To add a new VI, add its name and valid range to `VI_VALID_RANGE` in `config.py`.
 
 ---
 
@@ -245,6 +279,7 @@ All settings are in `config.py`. Key variables:
 | `LAMBDA_DEFAULT` | 500.0 | Default Whittaker smoothing λ |
 | `BASEMAP_MAX_DIM` | 500 | Max pixels per axis for display downsampling |
 | `PIXEL_METRIC_CONFIG` | (dict) | Thresholds for metric computation |
+| `VI_VALID_RANGE` | (dict) | Per-VI valid observation range; used for masking and y-axis bounds |
 
 Override `DATACUBE_ROOT` without editing code:
 ```bash

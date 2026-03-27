@@ -124,7 +124,7 @@ def _process_region(
     nx = len(x_vals)
     print(f"  Grid: {ny} rows × {nx} cols = {ny * nx:,} pixels")
 
-    vi_min, vi_max = VI_VALID_RANGE.get(vi_var, (-1.0, 2.0))
+    vi_min, vi_max = VI_VALID_RANGE.get(vi_var, (-1.0, 2.0))  # fallback = widest known range (EVI2)
     min_valid = config.get("min_valid_obs", 20)
 
     # Allocate output arrays — float32 pre-filled with the NC fill value.
