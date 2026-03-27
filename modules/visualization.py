@@ -469,6 +469,8 @@ def make_leaflet_map(
     zmax: float | None = None,
     native_lat_step: float | None = None,
     native_lon_step: float | None = None,
+    shapefile_paths: str | None = None,
+    shapefile_label_fields: str = "NAME",
 ) -> ipl.Map:
     """
     Build an ipyleaflet Map with:
@@ -537,6 +539,14 @@ def make_leaflet_map(
     m._lon_step = native_lon_step if native_lon_step is not None else lon_step
     m._lat_step = native_lat_step if native_lat_step is not None else lat_step
 
+    m._shapefile_layers: list[dict] = []
+    if shapefile_paths is not None:
+        paths  = shapefile_paths.split()
+        fields = shapefile_label_fields.split()
+        for i, path in enumerate(paths):
+            field = fields[i] if i < len(fields) else fields[-1]
+            add_shapefile_overlay(m, path, label_field=field)
+
     return m
 
 
@@ -596,6 +606,99 @@ def update_leaflet_map(
     else:
         m._pixel_rect.opacity      = 0.0
         m._pixel_rect.fill_opacity = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Shapefile overlay
+# ---------------------------------------------------------------------------
+
+def add_shapefile_overlay(
+    m: ipl.Map,
+    shapefile_path,
+    label_field: str = "NAME",
+) -> None:
+    """
+    Load a shapefile and add it to an existing ipyleaflet Map.
+
+    Adds two layers:
+      - A GeoJSON layer for the polygon/line outlines.
+      - One Marker + DivIcon per feature for persistent text labels
+        positioned at each feature's centroid.
+
+    Parameters
+    ----------
+    m              : ipyleaflet.Map to add layers to.
+    shapefile_path : Path or str to the .shp file.
+    label_field    : Attribute field name used as the label text.
+    """
+    try:
+        import geopandas as gpd
+    except ImportError:
+        print("geopandas not installed — shapefile overlay skipped.")
+        return
+
+    from pathlib import Path as _Path
+
+    path = _Path(shapefile_path)
+    if not path.exists():
+        print(f"Shapefile not found: {path} — overlay skipped.")
+        return
+
+    gdf = gpd.read_file(path)
+    # Reproject to WGS84 so coordinates match the Leaflet map
+    if gdf.crs is None or gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
+
+    # --- Shape outlines via GeoJSON layer ---
+    geojson_layer = ipl.GeoJSON(
+        data=gdf.__geo_interface__,
+        style={
+            "color": "#ffffff",
+            "weight": 2,
+            "fillOpacity": 0.0,
+        },
+        hover_style={
+            "color": "#ffff00",
+            "weight": 3,
+        },
+        name="Shapefile overlay",
+    )
+    m.add_layer(geojson_layer)
+
+    # --- Text labels via Marker + DivIcon at each centroid ---
+    label_markers = []
+    for _, row in gdf.iterrows():
+        label_text = str(row.get(label_field, "")) if label_field in gdf.columns else ""
+        if not label_text:
+            continue
+        centroid = row.geometry.centroid
+        icon = ipl.DivIcon(
+            html=f'<div style="'
+                 f'color:#ffffff;'
+                 f'font-size:11px;'
+                 f'font-weight:bold;'
+                 f'text-shadow:0 0 3px #000,0 0 3px #000;'
+                 f'white-space:nowrap;'
+                 f'pointer-events:none;'
+                 f'">{label_text}</div>',
+            icon_size=[0, 0],
+            icon_anchor=[0, 0],
+        )
+        marker = ipl.Marker(
+            location=[centroid.y, centroid.x],
+            icon=icon,
+            draggable=False,
+        )
+        m.add_layer(marker)
+        label_markers.append(marker)
+
+    # Register in the ordered layer list for checkbox-driven visibility toggling.
+    from pathlib import Path as _Path
+    m._shapefile_layers.append({
+        "name":   _Path(shapefile_path).stem,
+        "geojson": geojson_layer,
+        "labels":  label_markers,
+    })
 
 
 # ---------------------------------------------------------------------------

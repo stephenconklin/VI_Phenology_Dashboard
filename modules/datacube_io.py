@@ -156,7 +156,14 @@ def discover_regions(root: Path = DATACUBE_ROOT) -> dict[str, RegionPaths]:
 
         parent = nc_path.parent
         zarr_path    = parent / (nc_path.stem + ".zarr")
-        metrics_path = parent / (nc_path.stem + "_pixel_metrics.nc")
+        # pixel_phenology_extract.py writes NDVI_<region_id>_pixel_metrics.nc;
+        # fall back to <nc_stem>_pixel_metrics.nc for any alternative naming.
+        _metrics_canonical = parent / f"{vi_var}_{region_id}_pixel_metrics.nc"
+        _metrics_fallback  = parent / (nc_path.stem + "_pixel_metrics.nc")
+        metrics_path = (
+            _metrics_canonical if _metrics_canonical.exists()
+            else _metrics_fallback
+        )
 
         regions[region_id] = RegionPaths(
             region_id=region_id,

@@ -37,6 +37,8 @@ from config import (
     METRIC_GROUPS,
     METRIC_LABELS,
     PIXEL_METRIC_CONFIG,
+    SHAPEFILE_LABEL_FIELDS,
+    SHAPEFILE_PATHS,
     VI_VALID_RANGE,
 )
 from modules.datacube_io import (
@@ -73,6 +75,14 @@ from modules.visualization import (
 
 # Tile service choices for the basemap dropdown (defined in visualization.py).
 _TILE_CHOICES: dict[str, str] = {k: v["label"] for k, v in LEAFLET_TILE_SERVICES.items()}
+
+# Shapefile overlay names for the checkbox UI.
+# Keys are string indices ("0", "1", ...), values are file stems.
+from pathlib import Path as _P
+_SHAPEFILE_CHOICES: dict[str, str] = (
+    {str(i): _P(p).stem for i, p in enumerate(SHAPEFILE_PATHS.split())}
+    if SHAPEFILE_PATHS else {}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +182,7 @@ app_ui = ui.page_sidebar(
             },
             selected="3sd",
         ),
+        ui.output_ui("shapefile_toggles"),
         ui.output_ui("colorbar_panel"),
 
         # --- Lambda slider ---
@@ -598,6 +609,8 @@ def server(input: Inputs, output: Outputs, session: Session):
             zmax=zmax,
             native_lat_step=nat_lat_step,
             native_lon_step=nat_lon_step,
+            shapefile_paths=SHAPEFILE_PATHS,
+            shapefile_label_fields=SHAPEFILE_LABEL_FIELDS,
         )
 
         # Show pixel marker if a pixel is already selected (e.g. region switch)
@@ -614,6 +627,12 @@ def server(input: Inputs, output: Outputs, session: Session):
             click_lon = float(coordinates[1])
             with reactive.isolate():
                 ds = active_dataset()
+                _z, lon, lat = basemap_data()
+            # Ignore clicks outside the current region's data extent
+            # (e.g. clicks on shapefile polygons that extend beyond the datacube).
+            if not (float(lon.min()) <= click_lon <= float(lon.max())
+                    and float(lat.min()) <= click_lat <= float(lat.max())):
+                return
             yi, xi = click_to_array_index(click_lon, click_lat, ds)
             selected_idx.set((yi, xi))
             selected_coords.set((click_lon, click_lat))
@@ -668,6 +687,38 @@ def server(input: Inputs, output: Outputs, session: Session):
             zmax=zmax,
             selected_pixel=coords,
         )
+
+    # -----------------------------------------------------------------------
+    # Shapefile overlay toggles
+    # -----------------------------------------------------------------------
+
+    @render.ui
+    def shapefile_toggles():
+        if not _SHAPEFILE_CHOICES:
+            return ui.div()
+        return ui.div(
+            ui.tags.label("Overlay layers", class_="form-label"),
+            ui.input_checkbox_group(
+                id="shapefile_visible",
+                label=None,
+                choices=_SHAPEFILE_CHOICES,
+                selected=list(_SHAPEFILE_CHOICES.keys()),
+            ),
+        )
+
+    if _SHAPEFILE_CHOICES:
+        @reactive.Effect
+        @reactive.event(input.shapefile_visible)
+        def _toggle_shapefile_layers():
+            m = _fig_ref[0]
+            if m is None or not hasattr(m, "_shapefile_layers"):
+                return
+            visible_set = set(input.shapefile_visible())
+            for i, layer_dict in enumerate(m._shapefile_layers):
+                show = str(i) in visible_set
+                layer_dict["geojson"].visible = show
+                for marker in layer_dict["labels"]:
+                    marker.visible = show
 
     # -----------------------------------------------------------------------
     # Time series / annual-cycle / metric-trend widgets

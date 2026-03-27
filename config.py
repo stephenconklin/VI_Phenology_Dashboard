@@ -23,6 +23,24 @@ DATACUBE_ROOT: Path = Path(
 )
 
 # ---------------------------------------------------------------------------
+# Shapefile overlays (optional — set to None to disable)
+# ---------------------------------------------------------------------------
+
+# Space-separated list of shapefile paths to display over the basemap.
+# Set to None to disable all overlays.
+# Example: "data/regions.shp data/plots.shp"
+# SHAPEFILE_PATHS: str | None = None
+# SHAPEFILE_PATHS: str = "/Users/stephenconklin/Documents/ConklinGeospatial/Projects/GITHub/VI_Phenology_Dashboard/shapefiles/LVIS_Flightboxes.geojson \
+#                         /Users/stephenconklin/Documents/ConklinGeospatial/Projects/GITHub/VI_Phenology_Dashboard/shapefiles/BioSCape_HLS_Tiles.geojson"
+SHAPEFILE_PATHS: str = "/Users/stephenconklin/Documents/ConklinGeospatial/Projects/GITHub/VI_Phenology_Dashboard/shapefiles/LVIS_Flightboxes.geojson"
+
+# Space-separated list of attribute field names used as labels, one per file.
+# Must match the order of SHAPEFILE_PATHS.
+# Example: "NAME plot_id"
+# SHAPEFILE_LABEL_FIELDS: str = "box_nr Name"
+SHAPEFILE_LABEL_FIELDS: str = "box_nr"
+
+# ---------------------------------------------------------------------------
 # Spatial / coordinate reference
 # ---------------------------------------------------------------------------
 
