@@ -23,6 +23,24 @@ DATACUBE_ROOT: Path = Path(
 )
 
 # ---------------------------------------------------------------------------
+# Shapefile overlays (optional — set to None to disable)
+# ---------------------------------------------------------------------------
+
+# Space-separated list of shapefile paths to display over the basemap.
+# Set to None to disable all overlays.
+# Example: "data/regions.shp data/plots.shp"
+# SHAPEFILE_PATHS: str | None = None
+# SHAPEFILE_PATHS: str = "/Users/stephenconklin/Documents/ConklinGeospatial/Projects/GITHub/VI_Phenology_Dashboard/shapefiles/LVIS_Flightboxes.geojson \
+#                         /Users/stephenconklin/Documents/ConklinGeospatial/Projects/GITHub/VI_Phenology_Dashboard/shapefiles/BioSCape_HLS_Tiles.geojson"
+SHAPEFILE_PATHS: str = "/Users/stephenconklin/Documents/ConklinGeospatial/Projects/GITHub/VI_Phenology_Dashboard/shapefiles/LVIS_Flightboxes.geojson"
+
+# Space-separated list of attribute field names used as labels, one per file.
+# Must match the order of SHAPEFILE_PATHS.
+# Example: "NAME plot_id"
+# SHAPEFILE_LABEL_FIELDS: str = "box_nr Name"
+SHAPEFILE_LABEL_FIELDS: str = "box_nr"
+
+# ---------------------------------------------------------------------------
 # Spatial / coordinate reference
 # ---------------------------------------------------------------------------
 
@@ -59,8 +77,15 @@ LAMBDA_STEP: int = 10
 # Basemap display
 # ---------------------------------------------------------------------------
 
-# Maximum pixel count per axis when downsampling for display.
+# Maximum pixel count per axis for the on-the-fly Dask basemap path.
+# Kept small for performance (Dask compute over full time axis).
 BASEMAP_MAX_DIM: int = 500
+
+# Maximum pixel count per axis for the precomputed pixel_metrics.nc path.
+# Data is already reduced to 2D so no Dask cost — use a higher limit to
+# display at or near native 30 m resolution for all current LVIS regions
+# (largest is G5_14 at 2 222 × 409 px).
+BASEMAP_MAX_DIM_PRECOMPUTED: int = 2000
 
 # Fast basemap metrics always available (no precomputed file required).
 # Keys are the internal metric IDs used in compute_basemap_metric().

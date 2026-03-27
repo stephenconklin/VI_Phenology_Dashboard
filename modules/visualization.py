@@ -467,6 +467,10 @@ def make_leaflet_map(
     metric_opacity: float = 0.75,
     zmin: float | None = None,
     zmax: float | None = None,
+    native_lat_step: float | None = None,
+    native_lon_step: float | None = None,
+    shapefile_paths: str | None = None,
+    shapefile_label_fields: str = "NAME",
 ) -> ipl.Map:
     """
     Build an ipyleaflet Map with:
@@ -530,8 +534,18 @@ def make_leaflet_map(
     m._tile_layer    = tile_layer
     m._image_overlay = image_overlay
     m._pixel_rect    = pixel_rect
-    m._lon_step      = lon_step
-    m._lat_step      = lat_step
+    # Use native pixel step for the selection rectangle when available so the
+    # yellow highlight outlines exactly one 30 m pixel, not a coarsened block.
+    m._lon_step = native_lon_step if native_lon_step is not None else lon_step
+    m._lat_step = native_lat_step if native_lat_step is not None else lat_step
+
+    m._shapefile_layers: list[dict] = []
+    if shapefile_paths is not None:
+        paths  = shapefile_paths.split()
+        fields = shapefile_label_fields.split()
+        for i, path in enumerate(paths):
+            field = fields[i] if i < len(fields) else fields[-1]
+            add_shapefile_overlay(m, path, label_field=field)
 
     return m
 
@@ -595,6 +609,99 @@ def update_leaflet_map(
 
 
 # ---------------------------------------------------------------------------
+# Shapefile overlay
+# ---------------------------------------------------------------------------
+
+def add_shapefile_overlay(
+    m: ipl.Map,
+    shapefile_path,
+    label_field: str = "NAME",
+) -> None:
+    """
+    Load a shapefile and add it to an existing ipyleaflet Map.
+
+    Adds two layers:
+      - A GeoJSON layer for the polygon/line outlines.
+      - One Marker + DivIcon per feature for persistent text labels
+        positioned at each feature's centroid.
+
+    Parameters
+    ----------
+    m              : ipyleaflet.Map to add layers to.
+    shapefile_path : Path or str to the .shp file.
+    label_field    : Attribute field name used as the label text.
+    """
+    try:
+        import geopandas as gpd
+    except ImportError:
+        print("geopandas not installed — shapefile overlay skipped.")
+        return
+
+    from pathlib import Path as _Path
+
+    path = _Path(shapefile_path)
+    if not path.exists():
+        print(f"Shapefile not found: {path} — overlay skipped.")
+        return
+
+    gdf = gpd.read_file(path)
+    # Reproject to WGS84 so coordinates match the Leaflet map
+    if gdf.crs is None or gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
+
+    # --- Shape outlines via GeoJSON layer ---
+    geojson_layer = ipl.GeoJSON(
+        data=gdf.__geo_interface__,
+        style={
+            "color": "#ffffff",
+            "weight": 2,
+            "fillOpacity": 0.0,
+        },
+        hover_style={
+            "color": "#ffff00",
+            "weight": 3,
+        },
+        name="Shapefile overlay",
+    )
+    m.add_layer(geojson_layer)
+
+    # --- Text labels via Marker + DivIcon at each centroid ---
+    label_markers = []
+    for _, row in gdf.iterrows():
+        label_text = str(row.get(label_field, "")) if label_field in gdf.columns else ""
+        if not label_text:
+            continue
+        centroid = row.geometry.centroid
+        icon = ipl.DivIcon(
+            html=f'<div style="'
+                 f'color:#ffffff;'
+                 f'font-size:11px;'
+                 f'font-weight:bold;'
+                 f'text-shadow:0 0 3px #000,0 0 3px #000;'
+                 f'white-space:nowrap;'
+                 f'pointer-events:none;'
+                 f'">{label_text}</div>',
+            icon_size=[0, 0],
+            icon_anchor=[0, 0],
+        )
+        marker = ipl.Marker(
+            location=[centroid.y, centroid.x],
+            icon=icon,
+            draggable=False,
+        )
+        m.add_layer(marker)
+        label_markers.append(marker)
+
+    # Register in the ordered layer list for checkbox-driven visibility toggling.
+    from pathlib import Path as _Path
+    m._shapefile_layers.append({
+        "name":   _Path(shapefile_path).stem,
+        "geojson": geojson_layer,
+        "labels":  label_markers,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Time series plot
 # ---------------------------------------------------------------------------
 
@@ -655,25 +762,16 @@ def make_timeseries_figure(
         f"n={int(ts.valid_mask.sum())} valid obs"
     )
 
-    # Horizontal reference lines at zmin / zmax — only when the basemap metric
-    # is in NDVI units so the scale is meaningful on a NDVI y-axis.
-    shapes: list[dict] = []
-    if (basemap_metric and _ndvi_compatible(basemap_metric)
-            and zmin is not None and zmax is not None):
-        cmap = matplotlib.colormaps[_mpl_cmap_for(basemap_metric)]
-        _vi_lo, _vi_hi = VI_VALID_RANGE.get(vi_var, (-0.2, 1.1))
-        for level, cmap_t, label in [(zmin, 0.0, "range min"), (zmax, 1.0, "range max")]:
-            if _vi_lo - 0.1 <= level <= _vi_hi + 0.1:
-                r, g, b, _ = cmap(cmap_t)
-                line_color = f"rgb({int(r*255)},{int(g*255)},{int(b*255)})"
-                shapes.append(dict(
-                    type="line",
-                    x0=0, x1=1, xref="paper",
-                    y0=level, y1=level, yref="y",
-                    line=dict(color=line_color, width=1.5, dash="dot"),
-                    label=dict(text=f" {label}: {level:.3f}",
-                               textposition="end", font=dict(size=9, color=line_color)),
-                ))
+    # Y-axis: autoscale to the actual plotted data so the smoothed curve and
+    # all observations are always within the plot area regardless of filter.
+    all_values = obs_vi + [v for v in smooth_vi if v is not None and not math.isnan(v)]
+    if all_values:
+        _dmin, _dmax = min(all_values), max(all_values)
+        _pad = max((_dmax - _dmin) * 0.08, 0.02)
+        y_range = [_dmin - _pad, _dmax + _pad]
+    else:
+        _vi_lo, _vi_hi = VI_VALID_RANGE.get(vi_var, (-0.15, 1.05))
+        y_range = [_vi_lo - 0.05, _vi_hi + 0.05]
 
     fig = go.FigureWidget(
         data=[raw_trace, smooth_trace],
@@ -688,18 +786,14 @@ def make_timeseries_figure(
             xaxis=dict(title="Date", showgrid=True, gridcolor="#e0e0e0"),
             yaxis=dict(
                 title=vi_var,
-                range=[
-                    VI_VALID_RANGE.get(vi_var, (-0.15, 1.05))[0] - 0.05,
-                    VI_VALID_RANGE.get(vi_var, (-0.15, 1.05))[1] + 0.05,
-                ],
+                range=y_range,
                 showgrid=True,
                 gridcolor="#e0e0e0",
             ),
-            shapes=shapes,
             autosize=True,
             legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
             margin=dict(l=60, r=20, t=70, b=50),
-            uirevision="timeseries",
+            uirevision=f"timeseries-{zmin}-{zmax}",
             plot_bgcolor="#f8f8f8",
         ),
     )
@@ -859,26 +953,15 @@ def make_annual_cycle_figure(
             hovertemplate="Mean, DOY %{x}: %{y:.4f}<extra></extra>",
         ))
 
-    # Reference lines matching the map colorscale
-    shapes: list[dict] = []
-    if (basemap_metric and _ndvi_compatible(basemap_metric)
-            and zmin is not None and zmax is not None):
-        cmap = matplotlib.colormaps[_mpl_cmap_for(basemap_metric)]
-        for level, t, lbl in [
-            (zmin, 0.0, f"range min: {zmin:.3f}"),
-            (zmax, 1.0, f"range max: {zmax:.3f}"),
-        ]:
-            _vi_lo, _vi_hi = VI_VALID_RANGE.get(vi_var, (-0.2, 1.1))
-            if _vi_lo - 0.1 <= level <= _vi_hi + 0.1:
-                r, g, b, _ = cmap(t)
-                col = f"rgb({int(r*255)},{int(g*255)},{int(b*255)})"
-                shapes.append(dict(
-                    type="line", x0=0, x1=1, xref="paper",
-                    y0=level, y1=level, yref="y",
-                    line=dict(color=col, width=1.5, dash="dot"),
-                    label=dict(text=f" {lbl}", textposition="end",
-                               font=dict(size=9, color=col)),
-                ))
+    # Y-axis: autoscale to the actual smoothed data so all traces stay visible.
+    valid_vals = smoothed[~np.isnan(smoothed)]
+    if len(valid_vals) > 0:
+        _dmin, _dmax = float(valid_vals.min()), float(valid_vals.max())
+        _pad = max((_dmax - _dmin) * 0.08, 0.02)
+        y_range = [_dmin - _pad, _dmax + _pad]
+    else:
+        _vi_lo, _vi_hi = VI_VALID_RANGE.get(vi_var, (-0.15, 1.05))
+        y_range = [_vi_lo - 0.05, _vi_hi + 0.05]
 
     return go.FigureWidget(
         data=traces,
@@ -888,19 +971,15 @@ def make_annual_cycle_figure(
                        range=[1, 366]),
             yaxis=dict(
                 title=vi_var,
-                range=[
-                    VI_VALID_RANGE.get(vi_var, (-0.15, 1.05))[0] - 0.05,
-                    VI_VALID_RANGE.get(vi_var, (-0.15, 1.05))[1] + 0.05,
-                ],
+                range=y_range,
                 showgrid=True,
                 gridcolor="#e0e0e0",
             ),
-            shapes=shapes,
             legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0,
                         font=dict(size=10)),
             autosize=True,
             margin=dict(l=60, r=20, t=70, b=50),
-            uirevision="annual_cycle",
+            uirevision=f"annual_cycle-{zmin}-{zmax}",
             plot_bgcolor="#f8f8f8",
         ),
     )

@@ -16,6 +16,7 @@ dependencies:
   - pillow
   - matplotlib
   - ipyleaflet
+  - geopandas
   - tqdm
   - pip
   - pip:

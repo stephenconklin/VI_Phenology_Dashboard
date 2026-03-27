@@ -32,6 +32,7 @@ from config import (
     DATACUBE_CRS_EPSG,
     TARGET_CRS_EPSG,
     BASEMAP_MAX_DIM,
+    BASEMAP_MAX_DIM_PRECOMPUTED,
     VI_VALID_RANGE,
 )
 
@@ -155,7 +156,14 @@ def discover_regions(root: Path = DATACUBE_ROOT) -> dict[str, RegionPaths]:
 
         parent = nc_path.parent
         zarr_path    = parent / (nc_path.stem + ".zarr")
-        metrics_path = parent / (nc_path.stem + "_pixel_metrics.nc")
+        # pixel_phenology_extract.py writes NDVI_<region_id>_pixel_metrics.nc;
+        # fall back to <nc_stem>_pixel_metrics.nc for any alternative naming.
+        _metrics_canonical = parent / f"{vi_var}_{region_id}_pixel_metrics.nc"
+        _metrics_fallback  = parent / (nc_path.stem + "_pixel_metrics.nc")
+        metrics_path = (
+            _metrics_canonical if _metrics_canonical.exists()
+            else _metrics_fallback
+        )
 
         regions[region_id] = RegionPaths(
             region_id=region_id,
@@ -381,9 +389,20 @@ def _regrid_to_wgs84(
         fill_value=np.nan,
     )
 
-    # Regular WGS84 target grid — lat increases south→north (Plotly default).
+    # Regular WGS84 target grid — lon increases west→east (linear in Mercator-x).
     lon_reg = np.linspace(float(lon_2d.min()), float(lon_2d.max()), nx)
-    lat_reg = np.linspace(float(lat_2d.min()), float(lat_2d.max()), ny)
+
+    # Rows evenly spaced in Mercator-y so that Leaflet's linear ImageOverlay
+    # stretch is geometrically exact (eliminates ~50 m mid-region drift).
+    R         = 6_378_137.0  # WGS84 semi-major axis
+    lat_min_r = np.radians(float(lat_2d.min()))
+    lat_max_r = np.radians(float(lat_2d.max()))
+    merc_y    = np.linspace(
+        R * np.log(np.tan(np.pi / 4 + lat_min_r / 2)),
+        R * np.log(np.tan(np.pi / 4 + lat_max_r / 2)),
+        ny,
+    )
+    lat_reg = 2.0 * np.degrees(np.arctan(np.exp(merc_y / R))) - 90.0
     lon_grid, lat_grid = np.meshgrid(lon_reg, lat_reg)
 
     # Convert target WGS84 positions → UTM for the interpolator lookup.
@@ -431,9 +450,12 @@ def compute_basemap_metric(
     # per tile rather than a multi-chunk aggregation.
     da = da.chunk({"time": -1})
 
-    # Compute coarsening factors to stay within max_dim × max_dim
+    # Compute coarsening factors to stay within max_dim × max_dim.
+    # Equalize so both axes use the same factor → square display pixels
+    # (unequal factors produce elongated rectangles for tall/narrow regions).
     cf_y = max(1, ny // max_dim)
     cf_x = max(1, nx // max_dim)
+    cf_y = cf_x = max(cf_y, cf_x)
 
     # Coarsen spatially first (still lazy), then reduce over time
     da_c = da.coarsen(y=cf_y, x=cf_x, boundary="trim").mean()
@@ -466,12 +488,17 @@ def compute_basemap_metric(
 def load_metrics_for_basemap(
     metrics_path: Path,
     metric: str,
-    max_dim: int = BASEMAP_MAX_DIM,
+    max_dim: int = BASEMAP_MAX_DIM_PRECOMPUTED,
     src_epsg: int = DATACUBE_CRS_EPSG,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Fast path: load one 2-D metric slice from a precomputed pixel_metrics.nc.
     Returns (z_2d, lon_2d, lat_2d) at display resolution.
+
+    Uses BASEMAP_MAX_DIM_PRECOMPUTED (default 2 000) rather than the smaller
+    on-the-fly limit so that all current LVIS regions (≤ 2 222 × 409 px)
+    are displayed at native 30 m resolution without any coarsening.
+    Coarsening factors are equalised to keep display pixels square.
     """
     with xr.open_dataset(str(metrics_path), mask_and_scale=True) as ds_m:
         if metric not in ds_m:
@@ -483,7 +510,8 @@ def load_metrics_for_basemap(
         ny, nx = da.sizes["y"], da.sizes["x"]
         cf_y = max(1, ny // max_dim)
         cf_x = max(1, nx // max_dim)
-        if cf_y > 1 or cf_x > 1:
+        cf_y = cf_x = max(cf_y, cf_x)   # equalize → square display pixels
+        if cf_y > 1:
             da = da.coarsen(y=cf_y, x=cf_x, boundary="trim").mean()
         z = da.values
         x_c = da["x"].values
