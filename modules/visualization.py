@@ -577,18 +577,16 @@ def update_leaflet_map(
         z, lat, metric_key, zmin, zmax, metric_opacity
     )
 
-    # Swap tile layer only when the service key actually changes
+    # Swap tile layer only when the service key actually changes.
+    # Mutate the existing TileLayer object in place — ipywidgets sends only
+    # the changed property deltas to the browser, Leaflet reloads tiles
+    # automatically, and layer ordering is never disturbed.
     if tile_service is not None:
         svc = LEAFLET_TILE_SERVICES.get(tile_service, LEAFLET_TILE_SERVICES["World_Imagery"])
         if m._tile_layer.url != svc["url"]:
-            m.remove_layer(m._tile_layer)
-            m._tile_layer = ipl.TileLayer(
-                url=svc["url"],
-                attribution=svc["attribution"],
-                max_zoom=svc.get("max_zoom", 18),
-                name="Basemap",
-            )
-            m.add_layer(m._tile_layer)
+            m._tile_layer.url         = svc["url"]
+            m._tile_layer.attribution = svc["attribution"]
+            m._tile_layer.max_zoom    = svc.get("max_zoom", 18)
 
     # Show / hide the selected-pixel rectangle.
     # Bounds are sized to exactly one pixel footprint using the step sizes
