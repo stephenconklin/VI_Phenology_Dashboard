@@ -187,7 +187,7 @@ def _natural_sort_key(name: str):
 # Dataset handles — lru_cache so files are opened only once per session
 # ---------------------------------------------------------------------------
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=18)
 def _open_datacube_cached(nc_path_str: str) -> xr.Dataset:
     """
     Open a NetCDF4 datacube with xarray + Dask using the file's native
@@ -199,6 +199,7 @@ def _open_datacube_cached(nc_path_str: str) -> xr.Dataset:
     needed for efficient temporal reduction.
 
     String argument (not Path) required for lru_cache hashability.
+    maxsize=18 covers all current LVIS regions so handles are never evicted.
     """
     return xr.open_dataset(
         nc_path_str,
@@ -208,13 +209,25 @@ def _open_datacube_cached(nc_path_str: str) -> xr.Dataset:
     )
 
 
+@lru_cache(maxsize=18)
+def _open_zarr_cached(zarr_path_str: str) -> xr.Dataset:
+    """
+    Open a Zarr store with xarray (lazy).  Cached so the store is opened
+    only once per session per region, and reused for both basemap display
+    and fast pixel extraction.
+
+    String argument (not Path) required for lru_cache hashability.
+    """
+    return xr.open_zarr(zarr_path_str)
+
+
 def get_dataset(paths: RegionPaths) -> xr.Dataset:
     """
     Return a lazily opened dataset for the region.
     Prefers ZARR (faster pixel access) when available.
     """
     if paths.zarr_path is not None:
-        return xr.open_zarr(str(paths.zarr_path))
+        return _open_zarr_cached(str(paths.zarr_path))
     return _open_datacube_cached(str(paths.nc_path))
 
 
@@ -417,6 +430,55 @@ def _regrid_to_wgs84(
 
 
 # ---------------------------------------------------------------------------
+# Basemap disk cache helpers
+# ---------------------------------------------------------------------------
+
+def basemap_cache_path(nc_path: Path, metric: str, max_dim: int) -> Path:
+    """
+    Return the path of the on-disk basemap cache file for a given
+    (nc_path, metric, max_dim) combination.
+
+    Naming: <nc_stem>_basemap_<metric>_d<max_dim>.npz
+    e.g.    NDVI_G5_14_datacube_basemap_mean_ndvi_d500.npz
+
+    The file lives next to the .nc file so it is easy to find and delete.
+    """
+    return nc_path.parent / f"{nc_path.stem}_basemap_{metric}_d{max_dim}.npz"
+
+
+def load_basemap_cache(
+    cache_path: Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """
+    Load a cached (z, lon, lat) triple from disk.
+    Returns None if the file does not exist or cannot be read.
+    """
+    if not cache_path.exists():
+        return None
+    try:
+        data = np.load(str(cache_path))
+        return data["z"], data["lon"], data["lat"]
+    except Exception:
+        return None
+
+
+def save_basemap_cache(
+    cache_path: Path,
+    z: np.ndarray,
+    lon: np.ndarray,
+    lat: np.ndarray,
+) -> None:
+    """
+    Persist (z, lon, lat) to a compressed .npz file.
+    Silently ignores write errors (e.g. read-only volume).
+    """
+    try:
+        np.savez_compressed(str(cache_path), z=z, lon=lon, lat=lat)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Basemap spatial metrics — lazy Dask compute, downsampled
 # ---------------------------------------------------------------------------
 
@@ -525,29 +587,95 @@ def load_metrics_for_basemap(
 
 
 # ---------------------------------------------------------------------------
-# Single-pixel time series — direct HDF5 hyperslab read
+# Single-pixel time series — direct HDF5 hyperslab read OR Zarr isel
 # ---------------------------------------------------------------------------
+
+def _extract_pixel_timeseries_zarr(
+    zarr_path: Path,
+    yi: int,
+    xi: int,
+    vi_var: str = DEFAULT_VI_VAR,
+) -> PixelTimeSeries:
+    """
+    Fast pixel extraction from a Zarr store.
+
+    With chunks [time=-1, y=10, x=10] exactly one Zarr chunk is read
+    (worst case 4 chunks at a spatial chunk boundary), vs decompressing the
+    entire NetCDF file with the HDF5 hyperslab approach.
+    """
+    ds = _open_zarr_cached(str(zarr_path))
+
+    # Pull only the pixel's time series (triggers single-chunk read)
+    pixel_da = ds[vi_var].isel(y=yi, x=xi)
+    vi_arr = pixel_da.values.astype(np.float32)
+
+    # Decode time coordinate
+    time_raw = ds["time"].values
+    if np.issubdtype(time_raw.dtype, np.datetime64):
+        times = pd.DatetimeIndex(pd.to_datetime(time_raw))
+        dates = np.array(times, dtype="datetime64[D]")
+    else:
+        origin = np.datetime64("1970-01-01", "D")
+        dates = origin + time_raw.astype("timedelta64[D]")
+
+    # Replace fill values with NaN
+    fill = ds[vi_var].encoding.get("_FillValue", None)
+    if fill is not None and not (isinstance(fill, float) and np.isnan(fill)):
+        vi_arr[vi_arr == fill] = np.nan
+
+    x_val = float(ds["x"].values[xi])
+    y_val = float(ds["y"].values[yi])
+
+    vi_min, vi_max = VI_VALID_RANGE.get(vi_var, (-1.0, 2.0))
+    valid_mask = (
+        ~np.isnan(vi_arr)
+        & (vi_arr >= vi_min)
+        & (vi_arr <= vi_max)
+    )
+
+    lon_arr, lat_arr = utm_to_latlon(np.array([x_val]), np.array([y_val]))
+
+    return PixelTimeSeries(
+        dates=dates,
+        raw_vi=vi_arr,
+        valid_mask=valid_mask,
+        x_coord=x_val,
+        y_coord=y_val,
+        lon=float(lon_arr[0]),
+        lat=float(lat_arr[0]),
+    )
 
 def extract_pixel_timeseries(
     nc_path: Path,
     yi: int,
     xi: int,
     vi_var: str = DEFAULT_VI_VAR,
+    zarr_path: Path | None = None,
 ) -> PixelTimeSeries:
     """
-    Extract the full time series for pixel (yi, xi) using a direct netCDF4
-    hyperslab read.  This reads only T floats (≈ 5 KB) — never the full array.
+    Extract the full time series for pixel (yi, xi).
+
+    Fast path (preferred): when zarr_path is provided, uses xarray isel on
+    the Zarr store.  With Zarr chunks [time=-1, y=10, x=10] this reads exactly
+    one chunk (≈ 580 KB) regardless of spatial extent — vs decompressing the
+    entire NetCDF file with the HDF5 hyperslab path.
+
+    Fallback: direct netCDF4 hyperslab read (reads only T floats but must
+    decompress every spatial chunk due to the [1, full_y, full_x] layout).
 
     Parameters
     ----------
-    nc_path : path to the .nc datacube file
-    yi, xi  : zero-based array indices (row = y direction, col = x direction)
-    vi_var  : name of the VI variable in the file
+    nc_path   : path to the .nc datacube file (used for time decoding + fallback)
+    yi, xi    : zero-based array indices (row = y direction, col = x direction)
+    vi_var    : name of the VI variable in the file
+    zarr_path : optional path to the companion .zarr store (preferred read path)
 
     Returns
     -------
     PixelTimeSeries namedtuple
     """
+    if zarr_path is not None:
+        return _extract_pixel_timeseries_zarr(zarr_path, yi, xi, vi_var)
     with nc4.Dataset(str(nc_path), mode="r") as ds:
         # Decode time to datetime64
         time_var = ds.variables["time"]

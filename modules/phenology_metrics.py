@@ -427,28 +427,31 @@ def compute_pixel_with_annual(
     date_cache: dict,
     lam: float,
     config: dict,
-) -> tuple[dict[str, float], list[int], dict[str, list]]:
+) -> tuple[dict[str, float], list[int], dict[str, list], np.ndarray, np.ndarray]:
     """
     Compute all 19 metrics AND per-year data arrays for plotting.
 
     Returns
     -------
-    metrics     : dict[str, float] — 19 aggregated metrics
-    valid_years : list[int]        — years that had sufficient data
-    annual_data : dict[str, list]  — per-year arrays aligned with valid_years:
-                      peak_ndvi, peak_doy, integrated, greenup, floor,
-                      ceiling, season_len, n_peaks, peak_sep, rel_amp, valley
-                  All lists have length == len(valid_years), NaN where the
-                  per-year condition was not met.
+    metrics       : dict[str, float]   — 19 aggregated metrics
+    valid_years   : list[int]          — years that had sufficient data
+    annual_data   : dict[str, list]    — per-year arrays aligned with valid_years:
+                        peak_ndvi, peak_doy, integrated, greenup, floor,
+                        ceiling, season_len, n_peaks, peak_sep, rel_amp, valley
+                    All lists have length == len(valid_years), NaN where the
+                    per-year condition was not met.
+    smoothed_daily : np.ndarray        — Whittaker-smoothed values on the daily grid
+    daily_dates    : np.ndarray        — datetime64[D] daily date array
     """
     nan_metrics = {m: np.nan for m in _METRIC_NAMES}
     empty_annual: dict[str, list] = {k: [] for k in [
         "peak_ndvi", "peak_doy", "integrated", "greenup", "floor",
         "ceiling", "season_len", "n_peaks", "peak_sep", "rel_amp", "valley",
     ]}
+    _empty_dates = ts.dates[:0].astype("datetime64[D]")  # zero-length sentinel
 
     if ts.valid_mask.sum() < config.get("min_valid_obs", 20):
-        return nan_metrics, [], empty_annual
+        return nan_metrics, [], empty_annual, np.array([], dtype=np.float64), _empty_dates
 
     n_days = date_cache["n_days"]
     lam_DTD = _cached_whittaker_system(n_days, lam)
@@ -466,6 +469,10 @@ def compute_pixel_with_annual(
     valid_years, annual_data = _run_annual_loop_tracked(
         smoothed, daily_w, date_cache, config
     )
+
+    # Build the daily date array (needed by callers for time-axis labelling)
+    first_date  = ts.dates[0]
+    daily_dates = first_date + np.arange(n_days).astype("timedelta64[D]")
 
     # Build aggregate metrics from the per-year lists
     def _safe_mean(lst):
@@ -507,7 +514,7 @@ def compute_pixel_with_annual(
         "valley_depth_mean":            _safe_mean(annual_data["valley"]),
     }
 
-    return metrics, valid_years, annual_data
+    return metrics, valid_years, annual_data, smoothed, daily_dates
 
 
 def source_available() -> bool:

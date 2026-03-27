@@ -23,11 +23,13 @@ Architecture notes
 from __future__ import annotations
 
 import numpy as np
+import threading
 from shiny import App, Inputs, Outputs, Session, reactive, render, ui
 from shinywidgets import output_widget, render_widget
 
 from config import (
     ALL_19_METRICS,
+    BASEMAP_MAX_DIM,
     DEFAULT_VI_VAR,
     FAST_BASEMAP_METRICS,
     LAMBDA_DEFAULT,
@@ -44,6 +46,7 @@ from config import (
 from modules.datacube_io import (
     PixelTimeSeries,
     RegionPaths,
+    basemap_cache_path,
     build_date_cache,
     click_to_array_index,
     compute_basemap_metric,
@@ -51,13 +54,13 @@ from modules.datacube_io import (
     discover_regions,
     extract_pixel_timeseries,
     get_dataset,
+    load_basemap_cache,
     load_metrics_for_basemap,
+    save_basemap_cache,
     utm_to_latlon,
 )
 from modules.phenology_metrics import (
-    compute_pixel_metrics,
     compute_pixel_with_annual,
-    smooth_pixel,
     source_available,
     source_error,
 )
@@ -121,6 +124,38 @@ _BASEMAP_CHOICES: dict[str, dict[str, str]] = {
     },
 }
 _DEFAULT_BASEMAP_KEY: str = FAST_BASEMAP_METRICS["Mean VI"]  # "mean_ndvi"
+
+
+# ---------------------------------------------------------------------------
+# Background pre-warm: compute + cache basemap for the default region
+# ---------------------------------------------------------------------------
+
+def _prewarm_default_basemap() -> None:
+    """
+    Called once in a background daemon thread at app startup.
+    Silently computes and caches the basemap for all 4 fast metrics on the
+    first (default) region.  By the time a user opens the app the cache is
+    already warm, so the first region loads instantly.
+
+    Errors are swallowed — this is a best-effort optimisation only.
+    """
+    if not ALL_REGIONS:
+        return
+    default_paths = next(iter(ALL_REGIONS.values()))
+    for metric in FAST_BASEMAP_METRICS.values():
+        cache = basemap_cache_path(default_paths.nc_path, metric, BASEMAP_MAX_DIM)
+        if cache.exists():
+            continue
+        try:
+            ds = get_dataset(default_paths)
+            result = compute_basemap_metric(ds, metric, vi_var=default_paths.vi_var)
+            save_basemap_cache(cache, *result)
+        except Exception:
+            pass
+
+
+if ALL_REGIONS:
+    threading.Thread(target=_prewarm_default_basemap, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -424,34 +459,54 @@ def server(input: Inputs, output: Outputs, session: Session):
         """
         Compute (z, lon, lat) for the basemap.
         Triggered by: region change OR basemap_metric change.
-        This is the most expensive operation (Dask compute, 2–20 s for
-        large files).  Uses precomputed pixel_metrics.nc when available.
+
+        Load order (fastest first):
+          1. Precomputed pixel_metrics.nc (phenology metrics only)
+          2. Disk cache (.npz alongside the NC file) — milliseconds
+          3. Dask on-the-fly compute — seconds to tens of seconds
+
+        On-the-fly results are written to the disk cache so subsequent
+        loads (new tabs, app restarts) skip the Dask step entirely.
+        A progress bar is shown in the browser while Dask computes.
         """
         paths  = region_paths()
         metric = basemap_metric_key()
         ds     = active_dataset()
 
-        # Fast path: precomputed metrics file + phenology metric requested
+        # Fast path 1: precomputed metrics file + phenology metric requested
         if paths.metrics_path is not None and metric in ALL_19_METRICS:
             try:
                 return load_metrics_for_basemap(paths.metrics_path, metric)
             except (KeyError, Exception):
-                pass  # fall through to on-the-fly
+                pass  # fall through
 
-        # On-the-fly fast metrics (always available)
+        # Resolve the actual metric key to compute (fall back for phenology w/o file)
         _fast_keys = set(FAST_BASEMAP_METRICS.values())
-        if metric in _fast_keys:
-            return compute_basemap_metric(ds, metric, vi_var=paths.vi_var)
+        if metric not in _fast_keys:
+            ui.notification_show(
+                f"No precomputed pixel_metrics.nc found for region "
+                f"'{input.region()}'. Showing Peak {paths.vi_var} instead. "
+                "Run tools/pixel_phenology_extract.py to generate pixel_metrics.nc.",
+                type="warning",
+                duration=10,
+            )
+            metric = "peak_ndvi_mean"
 
-        # Phenology metric requested but no precomputed file
-        ui.notification_show(
-            f"No precomputed pixel_metrics.nc found for region "
-            f"'{input.region()}'. Showing Peak {paths.vi_var} instead. "
-            "Run tools/pixel_phenology_extract.py to generate pixel_metrics.nc.",
-            type="warning",
-            duration=10,
-        )
-        return compute_basemap_metric(ds, "peak_ndvi_mean", vi_var=paths.vi_var)
+        # Fast path 2: disk cache
+        cache = basemap_cache_path(paths.nc_path, metric, BASEMAP_MAX_DIM)
+        hit = load_basemap_cache(cache)
+        if hit is not None:
+            return hit
+
+        # Slow path: Dask compute with progress indicator
+        with ui.Progress(min=0, max=3) as p:
+            p.set(1, message=f"Computing basemap…",
+                  detail=f"{paths.region_id} · {metric}")
+            result = compute_basemap_metric(ds, metric, vi_var=paths.vi_var)
+            p.set(2, detail="Saving cache…")
+            save_basemap_cache(cache, *result)
+            p.set(3)
+        return result
 
     @reactive.Calc
     def colorscale_limits() -> tuple[float | None, float | None]:
@@ -482,7 +537,11 @@ def server(input: Inputs, output: Outputs, session: Session):
         yi, xi = idx
         paths = region_paths()
         try:
-            return extract_pixel_timeseries(paths.nc_path, yi, xi, vi_var=paths.vi_var)
+            return extract_pixel_timeseries(
+            paths.nc_path, yi, xi,
+            vi_var=paths.vi_var,
+            zarr_path=paths.zarr_path,
+        )
         except Exception as exc:
             ui.notification_show(f"Pixel read error: {exc}", type="error", duration=6)
             return None
@@ -523,13 +582,14 @@ def server(input: Inputs, output: Outputs, session: Session):
     def smoothed_result() -> tuple[np.ndarray, np.ndarray] | None:
         """
         Whittaker-smoothed daily time series + daily date array.
-        Triggered by: narrowed_timeseries OR lambda_val change.
+        Derived from pixel_annual_data so the Whittaker solve runs only once
+        per (pixel, lambda, data-range) combination.
         """
-        ts = narrowed_timeseries()
-        if ts is None:
+        result = pixel_annual_data()
+        if result is None:
             return None
-        dc = dataset_date_cache()
-        return smooth_pixel(ts, dc, float(input.lambda_val()))
+        _metrics, _valid_years, _annual_data, smoothed_daily, daily_dates = result
+        return smoothed_daily, daily_dates
 
     @reactive.Calc
     def pixel_metric_config() -> dict:
@@ -571,7 +631,8 @@ def server(input: Inputs, output: Outputs, session: Session):
         result = pixel_annual_data()
         if result is None:
             return None
-        return result[0]
+        metrics, _valid_years, _annual_data, _smoothed, _dates = result
+        return metrics
 
     # -----------------------------------------------------------------------
     # Basemap widget
@@ -771,7 +832,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         if result is None:
             return make_empty_timeseries_figure()
 
-        metrics, valid_years, annual_data = result
+        metrics, valid_years, annual_data, _smoothed, _dates = result
         if not valid_years:
             return make_empty_timeseries_figure()
 

@@ -398,14 +398,18 @@ def make_metric_overlay_png(
     if zmax <= zmin:
         zmax = zmin + 1e-6
 
-    rgba = cmap(mcolors.Normalize(vmin=zmin, vmax=zmax)(z))  # (ny, nx, 4)
-    rgba[..., 3] = np.where(np.isnan(z), 0.0, opacity)
+    # bytes=True returns uint8 RGBA directly, avoiding a large float64 intermediate.
+    # For G5_14 at native resolution (853×4611) this saves ~110 MB of peak RAM.
+    nan_mask = np.isnan(z)
+    norm = mcolors.Normalize(vmin=zmin, vmax=zmax)
+    rgba = cmap(norm(z), bytes=True).copy()  # (ny, nx, 4) uint8
+    rgba[..., 3] = np.where(nan_mask, 0, int(np.clip(opacity, 0.0, 1.0) * 255))
 
     # Ensure north-first row order (top of PNG = north)
     if lat[0, 0] < lat[-1, 0]:
         rgba = rgba[::-1, :, :]
 
-    img = PILImage.fromarray((np.clip(rgba, 0, 1) * 255).astype(np.uint8), mode="RGBA")
+    img = PILImage.fromarray(rgba, mode="RGBA")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
