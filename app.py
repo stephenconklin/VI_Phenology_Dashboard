@@ -551,7 +551,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         if stored_region != input.region():
             return None
         ds = active_dataset()
-        ny, nx = ds.dims["y"], ds.dims["x"]
+        ny, nx = ds.sizes["y"], ds.sizes["x"]
         if yi >= ny or xi >= nx:
             return None
         return (yi, xi)

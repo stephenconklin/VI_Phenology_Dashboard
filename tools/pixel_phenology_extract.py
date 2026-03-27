@@ -30,21 +30,31 @@ Usage
   # Overwrite an existing file:
   python tools/pixel_phenology_extract.py --region G5_1 --overwrite
 
+  # Control parallelism (default: all logical CPUs):
+  python tools/pixel_phenology_extract.py --region G5_14 --workers 6
+  python tools/pixel_phenology_extract.py --region G5_14 --workers 1  # serial
+
 Performance notes
 -----------------
-  - Reads one row at a time: memory per row ~ n_time × nx × 4 bytes (~0.5–2 MB).
-  - The Whittaker penalty matrix is built once per datacube and reused for
-    every pixel (keyed on n_days and lambda).
-  - Typical speed: 1–5 ms per pixel; a 500×500 grid takes 4–20 minutes.
-  - For the largest regions (G5_7, G5_10, G5_14) expect 30–90 minutes.
-  - Progress is shown row-by-row via tqdm when it is installed.
+  - Row chunks are distributed across worker processes via ProcessPoolExecutor.
+  - Each worker opens its own netCDF4 file handle and rebuilds the Whittaker
+    matrix once; no shared state between processes.
+  - Default parallelism: all logical CPUs (os.cpu_count()).  Use --workers to
+    override (e.g. --workers 1 for serial, --workers 6 to leave headroom).
+  - Typical speed with 10 cores: 500×500 grid → 1–3 min;
+    G5_14 (2222×409) → 10–15 min.
+  - Memory per worker: ~(chunk_rows × nx × n_days × 8 B) for the row slab
+    plus ~(chunk_rows × nx × 19 × 4 B) for the partial result arrays.
+  - Progress is shown chunk-by-chunk via tqdm when it is installed.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 # Make modules/ and config.py importable regardless of working directory
@@ -76,6 +86,85 @@ from modules.phenology_metrics import _cached_whittaker_system, _extract_pixel_m
 _NC_FILL_F32 = np.float32(9.96921e+36)
 
 
+# ---------------------------------------------------------------------------
+# Worker function (must be at module level for multiprocessing "spawn")
+# ---------------------------------------------------------------------------
+
+def _worker_process_rows(
+    nc_path: str,
+    row_start: int,
+    row_end: int,
+    nx: int,
+    n_days: int,
+    lam: float,
+    config: dict,
+    date_cache: dict,
+    vi_var: str,
+    fill_val: float | None,
+) -> tuple[int, dict[str, np.ndarray]]:
+    """
+    Process rows [row_start, row_end) of one datacube in a worker process.
+
+    Returns
+    -------
+    row_start : int
+        First row index processed (used by the main process to place results).
+    partial : dict[str, np.ndarray]
+        Mapping of metric name → float32 array of shape (chunk_ny, nx).
+        Pixels without sufficient valid observations remain at _NC_FILL_F32.
+    """
+    # Rebuild the Whittaker penalty matrix once per worker (cheap; lru_cache
+    # avoids redundant work if the same worker handles multiple chunks).
+    lam_DTD = _cached_whittaker_system(n_days, float(lam))
+
+    vi_min    = config.get("vi_min",        -0.1)
+    vi_max    = config.get("vi_max",         1.0)
+    min_valid = config.get("min_valid_obs",   20)
+    chunk_ny  = row_end - row_start
+
+    partial: dict[str, np.ndarray] = {
+        m: np.full((chunk_ny, nx), _NC_FILL_F32, dtype=np.float32)
+        for m in ALL_19_METRICS
+    }
+
+    with nc4.Dataset(nc_path, mode="r") as nc_ds:
+        vi_ncvar = nc_ds.variables[vi_var]
+
+        for local_i in range(chunk_ny):
+            yi = row_start + local_i
+            # Hyperslab: full time series for all x in this row.
+            row_data = np.array(vi_ncvar[:, yi, :], dtype=np.float64)
+
+            if fill_val is not None and not np.isnan(fill_val):
+                row_data[row_data == fill_val] = np.nan
+
+            for xi in range(nx):
+                pixel_ts = row_data[:, xi]
+
+                valid = (
+                    ~np.isnan(pixel_ts)
+                    & (pixel_ts >= vi_min)
+                    & (pixel_ts <= vi_max)
+                )
+                if int(valid.sum()) < min_valid:
+                    continue  # partial stays at fill_value
+
+                metrics = _extract_pixel_metrics(
+                    pixel_ts, lam_DTD, config, date_cache
+                )
+                for m in ALL_19_METRICS:
+                    v = metrics.get(m, np.nan)
+                    partial[m][local_i, xi] = (
+                        _NC_FILL_F32 if np.isnan(float(v)) else np.float32(v)
+                    )
+
+    return row_start, partial
+
+
+# ---------------------------------------------------------------------------
+# Per-region orchestrator
+# ---------------------------------------------------------------------------
+
 def _process_region(
     region_id: str,
     paths,
@@ -83,6 +172,7 @@ def _process_region(
     config: dict,
     overwrite: bool,
     vi_var: str,
+    n_workers: int,
 ) -> None:
     """
     Compute per-pixel metrics for one region and write pixel_metrics.nc.
@@ -95,6 +185,7 @@ def _process_region(
     config    : PIXEL_METRIC_CONFIG dict (may have modified min_valid_obs)
     overwrite : if False, skip regions that already have pixel_metrics.nc
     vi_var    : name of the VI variable inside the datacube (e.g. "NDVI")
+    n_workers : number of parallel worker processes
     """
     out_name = f"{vi_var}_{region_id}_pixel_metrics.nc"
     out_path = paths.nc_path.parent / out_name
@@ -107,81 +198,102 @@ def _process_region(
     print(f"  Opening {paths.nc_path.name} …")
     t0 = time.time()
 
-    # --- Build date_cache from the time coordinate (cheap: reads ~5 KB) ----
-    ds_xr = get_dataset(paths)
+    # Build date_cache from the time coordinate (cheap: reads ~5 KB).
+    ds_xr      = get_dataset(paths)
     date_cache = build_date_cache(ds_xr)
-    n_days = date_cache["n_days"]
+    n_days     = date_cache["n_days"]
 
-    # Pre-build the Whittaker penalty matrix once; shared for all pixels.
     lam_DTD = _cached_whittaker_system(n_days, float(lam))
-    status = "ready" if lam_DTD is not None else "skipped (n_days < 3)"
+    status  = "ready" if lam_DTD is not None else "skipped (n_days < 3)"
     print(f"  n_days={n_days}, lambda={lam:.0f}, Whittaker matrix: {status}")
 
-    # --- Spatial dimensions from lazy dataset (coordinate arrays only) ------
-    y_vals = ds_xr["y"].values  # (ny,) UTM northings
-    x_vals = ds_xr["x"].values  # (nx,) UTM eastings
-    ny = len(y_vals)
-    nx = len(x_vals)
+    y_vals = ds_xr["y"].values   # (ny,) UTM northings
+    x_vals = ds_xr["x"].values   # (nx,) UTM eastings
+    ny     = len(y_vals)
+    nx     = len(x_vals)
     print(f"  Grid: {ny} rows × {nx} cols = {ny * nx:,} pixels")
+    print(f"  Workers: {n_workers}")
 
-    vi_min, vi_max = VI_VALID_RANGE.get(vi_var, (-1.0, 2.0))  # fallback = widest known range (EVI2)
-    min_valid = config.get("min_valid_obs", 20)
-
-    # Allocate output arrays — float32 pre-filled with the NC fill value.
-    # Pixels without sufficient valid observations will remain at fill_value.
-    results: dict[str, np.ndarray] = {
-        m: np.full((ny, nx), _NC_FILL_F32, dtype=np.float32)
-        for m in ALL_19_METRICS
-    }
-
-    # --- Main loop: one row read per iteration ------------------------------
+    # Read fill value from the source file.
     with nc4.Dataset(str(paths.nc_path), mode="r") as nc_ds:
         vi_ncvar = nc_ds.variables[vi_var]
         fill_val = getattr(vi_ncvar, "_FillValue", None)
         if fill_val is not None:
             fill_val = float(fill_val)
 
-        row_iter = range(ny)
+    # ------------------------------------------------------------------
+    # Build row chunks — one per worker for maximum contiguous I/O.
+    # Each chunk is a half-open interval [row_start, row_end).
+    # ------------------------------------------------------------------
+    actual_workers = min(n_workers, ny)
+    base, remainder = divmod(ny, actual_workers)
+    chunks: list[tuple] = []
+    row = 0
+    for i in range(actual_workers):
+        end = row + base + (1 if i < remainder else 0)
+        chunks.append((
+            str(paths.nc_path),
+            row, end,
+            nx, n_days, lam,
+            config, date_cache,
+            vi_var, fill_val,
+        ))
+        row = end
+
+    # Allocate full output arrays.
+    results: dict[str, np.ndarray] = {
+        m: np.full((ny, nx), _NC_FILL_F32, dtype=np.float32)
+        for m in ALL_19_METRICS
+    }
+
+    # ------------------------------------------------------------------
+    # Parallel execution
+    # ------------------------------------------------------------------
+    if actual_workers == 1:
+        # Single-worker: run inline to avoid subprocess spawn overhead.
+        iter_chunks = [chunks[0]]
         if _HAS_TQDM:
-            row_iter = tqdm(
-                row_iter,
+            iter_chunks = tqdm(
+                iter_chunks,
+                desc=f"  {region_id}",
+                unit="chunk",
+                leave=True,
+                dynamic_ncols=True,
+            )
+        for chunk in iter_chunks:
+            row_start, partial = _worker_process_rows(*chunk)
+            chunk_ny = partial[ALL_19_METRICS[0]].shape[0]
+            for m in ALL_19_METRICS:
+                results[m][row_start:row_start + chunk_ny, :] = partial[m]
+    else:
+        pbar = (
+            tqdm(
+                total=ny,
                 desc=f"  {region_id}",
                 unit="row",
                 leave=True,
                 dynamic_ncols=True,
             )
-
-        for yi in row_iter:
-            # Hyperslab: reads full time series for all x in this row.
-            # Shape: (n_time, nx).  Memory: n_time × nx × 4 bytes per row.
-            row_data = np.array(vi_ncvar[:, yi, :], dtype=np.float64)
-
-            # Replace dataset fill value with NaN
-            if fill_val is not None and not np.isnan(fill_val):
-                row_data[row_data == fill_val] = np.nan
-
-            for xi in range(nx):
-                pixel_ts = row_data[:, xi]
-
-                # Fast-skip pixels with insufficient valid data
-                valid = (
-                    ~np.isnan(pixel_ts)
-                    & (pixel_ts >= vi_min)
-                    & (pixel_ts <= vi_max)
-                )
-                if int(valid.sum()) < min_valid:
-                    continue  # results stay at fill_value
-
-                metrics = _extract_pixel_metrics(
-                    pixel_ts, lam_DTD, config, date_cache
-                )
+            if _HAS_TQDM else None
+        )
+        with ProcessPoolExecutor(max_workers=actual_workers) as executor:
+            future_map = {
+                executor.submit(_worker_process_rows, *chunk): chunk
+                for chunk in chunks
+            }
+            for future in as_completed(future_map):
+                row_start, partial = future.result()
+                chunk_ny = partial[ALL_19_METRICS[0]].shape[0]
                 for m in ALL_19_METRICS:
-                    v = metrics.get(m, np.nan)
-                    results[m][yi, xi] = (
-                        _NC_FILL_F32 if np.isnan(float(v)) else np.float32(v)
-                    )
+                    results[m][row_start:row_start + chunk_ny, :] = partial[m]
+                if pbar is not None:
+                    pbar.update(chunk_ny)
+        if pbar is not None:
+            pbar.close()
 
-    # --- Write output NetCDF4 -----------------------------------------------
+    # ------------------------------------------------------------------
+    # Write output NetCDF4
+    # ------------------------------------------------------------------
     print(f"  Writing {out_path.name} …")
     with nc4.Dataset(str(out_path), mode="w", format="NETCDF4") as out:
         out.description = (
@@ -190,24 +302,21 @@ def _process_region(
         )
         out.source_datacube = str(paths.nc_path)
         out.lambda_value    = float(lam)
-        out.min_valid_obs   = int(min_valid)
+        out.min_valid_obs   = int(config.get("min_valid_obs", 20))
 
-        # Dimensions
         out.createDimension("y", ny)
         out.createDimension("x", nx)
 
-        # Coordinate variables
-        yv = out.createVariable("y", "f8", ("y",))
-        yv[:] = y_vals
+        yv           = out.createVariable("y", "f8", ("y",))
+        yv[:]        = y_vals
         yv.units     = "m"
         yv.long_name = "UTM northing"
 
-        xv = out.createVariable("x", "f8", ("x",))
-        xv[:] = x_vals
+        xv           = out.createVariable("x", "f8", ("x",))
+        xv[:]        = x_vals
         xv.units     = "m"
         xv.long_name = "UTM easting"
 
-        # One 2-D variable per metric
         for m in ALL_19_METRICS:
             var = out.createVariable(
                 m, "f4", ("y", "x"),
@@ -215,15 +324,21 @@ def _process_region(
                 zlib=True,
                 complevel=4,
             )
-            var[:] = results[m]
-            var.long_name = m.replace("_", " ")
+            var[:]          = results[m]
+            var.long_name   = m.replace("_", " ")
 
     elapsed = time.time() - t0
     mins, secs = divmod(int(elapsed), 60)
     print(f"  Finished in {mins}m {secs}s  →  {out_path.name}")
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main() -> None:
+    _cpu_count = os.cpu_count() or 1
+
     parser = argparse.ArgumentParser(
         prog="pixel_phenology_extract",
         description=(
@@ -281,14 +396,26 @@ def main() -> None:
             "Without this flag existing files are skipped."
         ),
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=_cpu_count,
+        metavar="N",
+        help=(
+            f"Number of parallel worker processes.  "
+            f"Default: {_cpu_count} (all logical CPUs on this machine).  "
+            f"Use --workers 1 to run serially without subprocesses."
+        ),
+    )
 
     args = parser.parse_args()
 
-    # Override min_valid_obs in a copy of the config
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
+
     config = dict(PIXEL_METRIC_CONFIG)
     config["min_valid_obs"] = args.min_obs
 
-    # Discover regions
     try:
         all_regions = discover_regions()
     except FileNotFoundError as exc:
@@ -321,6 +448,7 @@ def main() -> None:
         f"  Lambda   : {args.lam}\n"
         f"  Min obs  : {args.min_obs}\n"
         f"  VI var   : {args.vi}\n"
+        f"  Workers  : {args.workers}\n"
         f"  Overwrite: {args.overwrite}\n"
     )
 
@@ -337,6 +465,7 @@ def main() -> None:
                 config=config,
                 overwrite=args.overwrite,
                 vi_var=args.vi,
+                n_workers=args.workers,
             )
         except Exception as exc:
             msg = f"  ERROR processing {region_id}: {exc}"
