@@ -837,13 +837,15 @@ def server(input: Inputs, output: Outputs, session: Session):
         if not _SHAPEFILE_CHOICES:
             return ui.div()
         return ui.div(
-            ui.tags.label("Overlay layers", class_="form-label"),
+            ui.tags.label("Overlay layers", class_="form-label",
+                          style="margin-bottom:4px"),
             ui.input_checkbox_group(
                 id="shapefile_visible",
                 label=None,
                 choices=_SHAPEFILE_CHOICES,
                 selected=list(_SHAPEFILE_CHOICES.keys()),
             ),
+            style="margin-top:4px",
         )
 
     if _SHAPEFILE_CHOICES:

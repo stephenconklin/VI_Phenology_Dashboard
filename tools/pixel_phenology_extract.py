@@ -36,21 +36,25 @@ Usage
 
 Performance notes
 -----------------
-  - Row chunks are distributed across worker processes via ProcessPoolExecutor.
+  - Work is split into small row chunks (--chunk-rows, default 20) so that
+    tqdm advances frequently regardless of how many workers are active.
+  - Chunks are distributed across worker processes via ProcessPoolExecutor;
+    the pool size is controlled by --workers (default: all logical CPUs).
   - Each worker opens its own netCDF4 file handle and rebuilds the Whittaker
     matrix once; no shared state between processes.
-  - Default parallelism: all logical CPUs (os.cpu_count()).  Use --workers to
-    override (e.g. --workers 1 for serial, --workers 6 to leave headroom).
+  - With --workers 1 the function runs inline (no subprocess spawn overhead)
+    while still showing per-chunk tqdm progress.
   - Typical speed with 10 cores: 500×500 grid → 1–3 min;
     G5_14 (2222×409) → 10–15 min.
   - Memory per worker: ~(chunk_rows × nx × n_days × 8 B) for the row slab
     plus ~(chunk_rows × nx × 19 × 4 B) for the partial result arrays.
-  - Progress is shown chunk-by-chunk via tqdm when it is installed.
+  - Progress is shown row-by-row via tqdm when it is installed.
 """
 
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import os
 import sys
 import time
@@ -173,19 +177,21 @@ def _process_region(
     overwrite: bool,
     vi_var: str,
     n_workers: int,
+    chunk_rows: int,
 ) -> None:
     """
     Compute per-pixel metrics for one region and write pixel_metrics.nc.
 
     Parameters
     ----------
-    region_id : e.g. "G5_1"
-    paths     : RegionPaths dataclass from discover_regions()
-    lam       : Whittaker smoothing lambda
-    config    : PIXEL_METRIC_CONFIG dict (may have modified min_valid_obs)
-    overwrite : if False, skip regions that already have pixel_metrics.nc
-    vi_var    : name of the VI variable inside the datacube (e.g. "NDVI")
-    n_workers : number of parallel worker processes
+    region_id  : e.g. "G5_1"
+    paths      : RegionPaths dataclass from discover_regions()
+    lam        : Whittaker smoothing lambda
+    config     : PIXEL_METRIC_CONFIG dict (may have modified min_valid_obs)
+    overwrite  : if False, skip regions that already have pixel_metrics.nc
+    vi_var     : name of the VI variable inside the datacube (e.g. "NDVI")
+    n_workers  : number of parallel worker processes (pool size)
+    chunk_rows : rows per work unit; controls tqdm update frequency
     """
     out_name = f"{vi_var}_{region_id}_pixel_metrics.nc"
     out_path = paths.nc_path.parent / out_name
@@ -211,9 +217,10 @@ def _process_region(
     x_vals = ds_xr["x"].values   # (nx,) UTM eastings
     ny     = len(y_vals)
     nx     = len(x_vals)
-    print(f"  Grid: {ny} rows × {nx} cols = {ny * nx:,} pixels")
-    print(f"  Workers: {n_workers}")
-
+    # ------------------------------------------------------------------
+    # Build row chunks — small fixed-size slices for frequent tqdm updates.
+    # Each chunk is a half-open interval [row_start, row_end).
+    # ------------------------------------------------------------------
     # Read fill value from the source file.
     with nc4.Dataset(str(paths.nc_path), mode="r") as nc_ds:
         vi_ncvar = nc_ds.variables[vi_var]
@@ -221,16 +228,11 @@ def _process_region(
         if fill_val is not None:
             fill_val = float(fill_val)
 
-    # ------------------------------------------------------------------
-    # Build row chunks — one per worker for maximum contiguous I/O.
-    # Each chunk is a half-open interval [row_start, row_end).
-    # ------------------------------------------------------------------
-    actual_workers = min(n_workers, ny)
-    base, remainder = divmod(ny, actual_workers)
+    actual_chunk_rows = max(1, min(chunk_rows, ny))
     chunks: list[tuple] = []
     row = 0
-    for i in range(actual_workers):
-        end = row + base + (1 if i < remainder else 0)
+    while row < ny:
+        end = min(row + actual_chunk_rows, ny)
         chunks.append((
             str(paths.nc_path),
             row, end,
@@ -240,6 +242,11 @@ def _process_region(
         ))
         row = end
 
+    n_chunks = len(chunks)
+    actual_workers = min(n_workers, n_chunks)
+    print(f"  Grid   : {ny} rows × {nx} cols = {ny * nx:,} pixels")
+    print(f"  Chunks : {n_chunks} × {actual_chunk_rows} rows  |  Workers: {actual_workers}")
+
     # Allocate full output arrays.
     results: dict[str, np.ndarray] = {
         m: np.full((ny, nx), _NC_FILL_F32, dtype=np.float32)
@@ -247,42 +254,81 @@ def _process_region(
     }
 
     # ------------------------------------------------------------------
-    # Parallel execution
+    # Execution — single-worker runs inline (no spawn overhead) while
+    # still showing per-chunk tqdm progress identical to the parallel path.
     # ------------------------------------------------------------------
+    def _make_pbar():
+        if not _HAS_TQDM:
+            return None
+        return tqdm(
+            total=ny,
+            desc=f"  {region_id}",
+            unit="row",
+            leave=True,
+            dynamic_ncols=True,
+        )
+
     if actual_workers == 1:
-        # Single-worker: run inline to avoid subprocess spawn overhead.
-        iter_chunks = [chunks[0]]
-        if _HAS_TQDM:
-            iter_chunks = tqdm(
-                iter_chunks,
-                desc=f"  {region_id}",
-                unit="chunk",
-                leave=True,
-                dynamic_ncols=True,
-            )
-        for chunk in iter_chunks:
+        # Inline — avoids subprocess spawn overhead on macOS (spawn method).
+        pbar = _make_pbar()
+        for chunk in chunks:
             row_start, partial = _worker_process_rows(*chunk)
             chunk_ny = partial[ALL_19_METRICS[0]].shape[0]
             for m in ALL_19_METRICS:
                 results[m][row_start:row_start + chunk_ny, :] = partial[m]
+            if pbar is not None:
+                pbar.update(chunk_ny)
+        if pbar is not None:
+            pbar.close()
     else:
-        pbar = (
-            tqdm(
-                total=ny,
-                desc=f"  {region_id}",
-                unit="row",
-                leave=True,
-                dynamic_ncols=True,
-            )
-            if _HAS_TQDM else None
+        # ------------------------------------------------------------------
+        # macOS defaults to 'spawn', which re-imports scipy/netCDF4/numpy
+        # in every worker — adding 30–120 s of silent startup per region.
+        # 'fork' avoids this: workers inherit the parent's already-imported
+        # modules.  It is safe here because the parent holds no threading
+        # locks at this point (no Dask compute, no Objective-C frameworks).
+        #
+        # HDF5_USE_FILE_LOCKING=FALSE prevents POSIX byte-range lock
+        # contention when multiple workers open the same .nc file on macOS
+        # APFS — a known source of indefinite hangs in read-only workloads.
+        # Thread-count caps stop each worker spawning its own BLAS threads,
+        # which causes CPU thrashing with many concurrent workers.
+        # ------------------------------------------------------------------
+        for _env_var, _default in [
+            ("HDF5_USE_FILE_LOCKING", "FALSE"),
+            ("OMP_NUM_THREADS",       "1"),
+            ("MKL_NUM_THREADS",       "1"),
+            ("OPENBLAS_NUM_THREADS",  "1"),
+        ]:
+            os.environ.setdefault(_env_var, _default)
+
+        _mp_ctx = (
+            multiprocessing.get_context("fork")
+            if sys.platform == "darwin"
+            else None  # use default (fork on Linux, spawn on Windows)
         )
-        with ProcessPoolExecutor(max_workers=actual_workers) as executor:
+        _ctx_name = "fork" if sys.platform == "darwin" else "spawn"
+
+        print(
+            f"  Spawning {actual_workers} worker processes "
+            f"(context: {_ctx_name}) …",
+            flush=True,
+        )
+        pbar = _make_pbar()
+        with ProcessPoolExecutor(
+            max_workers=actual_workers, mp_context=_mp_ctx
+        ) as executor:
             future_map = {
                 executor.submit(_worker_process_rows, *chunk): chunk
                 for chunk in chunks
             }
             for future in as_completed(future_map):
-                row_start, partial = future.result()
+                try:
+                    row_start, partial = future.result()
+                except Exception as exc:
+                    print(f"\n  WARNING: worker chunk failed: {exc}",
+                          file=sys.stderr)
+                    continue
                 chunk_ny = partial[ALL_19_METRICS[0]].shape[0]
                 for m in ALL_19_METRICS:
                     results[m][row_start:row_start + chunk_ny, :] = partial[m]
@@ -407,11 +453,25 @@ def main() -> None:
             f"Use --workers 1 to run serially without subprocesses."
         ),
     )
+    parser.add_argument(
+        "--chunk-rows",
+        dest="chunk_rows",
+        type=int,
+        default=20,
+        metavar="N",
+        help=(
+            "Rows per work unit submitted to the pool.  Smaller values give "
+            "more frequent tqdm progress updates at the cost of slightly more "
+            "inter-process communication overhead.  Default: 20."
+        ),
+    )
 
     args = parser.parse_args()
 
     if args.workers < 1:
         parser.error("--workers must be >= 1")
+    if args.chunk_rows < 1:
+        parser.error("--chunk-rows must be >= 1")
 
     config = dict(PIXEL_METRIC_CONFIG)
     config["min_valid_obs"] = args.min_obs
@@ -444,12 +504,13 @@ def main() -> None:
 
     print(
         f"VI Phenology Metric Extraction\n"
-        f"  Regions  : {len(targets)}\n"
-        f"  Lambda   : {args.lam}\n"
-        f"  Min obs  : {args.min_obs}\n"
-        f"  VI var   : {args.vi}\n"
-        f"  Workers  : {args.workers}\n"
-        f"  Overwrite: {args.overwrite}\n"
+        f"  Regions   : {len(targets)}\n"
+        f"  Lambda    : {args.lam}\n"
+        f"  Min obs   : {args.min_obs}\n"
+        f"  VI var    : {args.vi}\n"
+        f"  Workers   : {args.workers}\n"
+        f"  Chunk rows: {args.chunk_rows}\n"
+        f"  Overwrite : {args.overwrite}\n"
     )
 
     total_t0 = time.time()
@@ -466,6 +527,7 @@ def main() -> None:
                 overwrite=args.overwrite,
                 vi_var=args.vi,
                 n_workers=args.workers,
+                chunk_rows=args.chunk_rows,
             )
         except Exception as exc:
             msg = f"  ERROR processing {region_id}: {exc}"

@@ -248,6 +248,58 @@ recompute.  A progress bar is shown in the browser for any region not yet cached
 
 ---
 
+## One-Time Setup: Pixel Metrics Extraction (Optional)
+
+Pre-compute per-pixel phenological metrics for a region so that the full suite of
+19 metrics (Peak NDVI, Season Length, Bimodality, etc.) becomes available as basemap
+overlay options:
+
+```bash
+conda activate vi_phenology_dashboard
+
+# Extract all 19 metrics for one region (output: NDVI_G5_1_pixel_metrics.nc):
+python tools/pixel_phenology_extract.py --region G5_1
+
+# All regions at once (parallel, uses all logical CPUs by default):
+python tools/pixel_phenology_extract.py --all
+
+# Limit CPU cores (leave headroom for other work):
+python tools/pixel_phenology_extract.py --all --workers 6
+
+# Control progress-bar granularity (smaller = more frequent updates):
+python tools/pixel_phenology_extract.py --region G5_14 --chunk-rows 10
+
+# Adjust Whittaker lambda and minimum valid observations:
+python tools/pixel_phenology_extract.py --region G5_1 --lam 300 --min-obs 30
+
+# Overwrite an existing pixel_metrics.nc file:
+python tools/pixel_phenology_extract.py --region G5_1 --overwrite
+
+# Preview which regions would be processed (no files written):
+python tools/pixel_phenology_extract.py --all --dry-run
+```
+
+Output files are written as `{VI}_{region_id}_pixel_metrics.nc` in the same directory
+as the source datacube (e.g. `NDVI_G5_1_pixel_metrics.nc`).  The dashboard detects
+them automatically and adds the 19 metrics to the basemap dropdown.
+
+**Parallelism notes:**
+- On macOS the worker pool uses `fork` (not `spawn`) to avoid 30–120 s per-region
+  module-import overhead; this is safe because workers are read-only and hold no locks.
+- `HDF5_USE_FILE_LOCKING=FALSE` is set automatically to prevent POSIX lock contention
+  when multiple workers open the same `.nc` file simultaneously on APFS volumes.
+- `--chunk-rows` (default 20) controls the granularity of work units submitted to the
+  pool; smaller values give more frequent `tqdm` updates at marginal communication cost.
+
+**Typical run times** (10-core Mac):
+| Region | Grid | Time |
+|---|---|---|
+| G5_25 (tiny) | 72 × 100 | < 5 s |
+| G5_1 (medium) | ~500 × 500 | 1–3 min |
+| G5_14 (large) | 2222 × 409 | 10–15 min |
+
+---
+
 ## One-Time Setup: ZARR Conversion (Recommended for Large Files)
 
 Convert once, then the dashboard automatically uses the ZARR store for pixel reads:

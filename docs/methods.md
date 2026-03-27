@@ -475,7 +475,35 @@ Disk space: ≈ 1–1.5× the NC file size per Zarr store.
 | zarr | current | Rechunked storage format |
 | pillow | current | Image utilities |
 
-### 6.1 Core Metric Functions
+### 6.1 Batch Pixel Metric Extraction (`tools/pixel_phenology_extract.py`)
+
+`pixel_phenology_extract.py` applies the full Whittaker + 19-metric pipeline to every
+pixel in a datacube and writes a `{VI}_{region_id}_pixel_metrics.nc` file.
+
+**Parallelism design:**
+
+Work is divided into small row chunks (default 20 rows, tunable via `--chunk-rows`)
+rather than one chunk per worker.  This decouples progress-bar granularity from worker
+count and prevents any single slow chunk from stalling the entire pool.
+
+On macOS the pool is created with `multiprocessing.get_context("fork")` instead of the
+default `spawn` context.  The `spawn` context re-imports scipy, netCDF4, and numpy in
+every worker, adding 30–120 s of silent startup overhead per region.  The `fork` context
+is safe here because workers are strictly read-only and the parent holds no threading
+locks at fork time.
+
+`HDF5_USE_FILE_LOCKING=FALSE` is set before the pool is created to prevent POSIX
+byte-range lock contention when multiple workers open the same `.nc` file on APFS
+(macOS) volumes — a known source of indefinite hangs in read-only workloads.
+`OMP_NUM_THREADS`, `MKL_NUM_THREADS`, and `OPENBLAS_NUM_THREADS` are set to `1` to
+prevent each worker spawning its own BLAS thread pool (which causes CPU thrashing with
+many concurrent workers).
+
+With `--workers 1` the pool is bypassed entirely and chunks are processed inline,
+avoiding subprocess spawn latency while still advancing the tqdm progress bar
+row-by-row.
+
+### 6.2 Core Metric Functions
 
 The three Whittaker and metric functions are reproduced verbatim from the
 VI_Phenology pipeline and live in `modules/phenology_metrics.py`:
@@ -493,7 +521,7 @@ logic is identical to the upstream source.
 The dashboard is fully self-contained — no external VI_Phenology source tree is
 required at runtime.
 
-### 6.2 Time-Series Visualisation Panels
+### 6.3 Time-Series Visualisation Panels
 
 After a pixel is selected, three panels are available:
 
