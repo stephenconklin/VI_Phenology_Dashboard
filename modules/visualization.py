@@ -467,6 +467,8 @@ def make_leaflet_map(
     metric_opacity: float = 0.75,
     zmin: float | None = None,
     zmax: float | None = None,
+    native_lat_step: float | None = None,
+    native_lon_step: float | None = None,
 ) -> ipl.Map:
     """
     Build an ipyleaflet Map with:
@@ -530,8 +532,10 @@ def make_leaflet_map(
     m._tile_layer    = tile_layer
     m._image_overlay = image_overlay
     m._pixel_rect    = pixel_rect
-    m._lon_step      = lon_step
-    m._lat_step      = lat_step
+    # Use native pixel step for the selection rectangle when available so the
+    # yellow highlight outlines exactly one 30 m pixel, not a coarsened block.
+    m._lon_step = native_lon_step if native_lon_step is not None else lon_step
+    m._lat_step = native_lat_step if native_lat_step is not None else lat_step
 
     return m
 

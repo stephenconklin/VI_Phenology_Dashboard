@@ -45,10 +45,12 @@ from modules.datacube_io import (
     build_date_cache,
     click_to_array_index,
     compute_basemap_metric,
+    detect_crs_epsg,
     discover_regions,
     extract_pixel_timeseries,
     get_dataset,
     load_metrics_for_basemap,
+    utm_to_latlon,
 )
 from modules.phenology_metrics import (
     compute_pixel_metrics,
@@ -378,6 +380,30 @@ def server(input: Inputs, output: Outputs, session: Session):
         return build_date_cache(active_dataset())
 
     @reactive.Calc
+    def native_pixel_step() -> tuple[float, float]:
+        """
+        Native pixel footprint in WGS84 degrees: (lat_step, lon_step).
+        Reads only the x/y coordinate arrays — never the data variable.
+        Used to size the selection rectangle to exactly one 30 m pixel.
+        """
+        ds   = active_dataset()
+        x_v  = ds["x"].values
+        y_v  = ds["y"].values
+        dx_m = abs(float(x_v[1] - x_v[0]))   # metres per native pixel (x)
+        dy_m = abs(float(y_v[1] - y_v[0]))   # metres per native pixel (y)
+        x_mid = float((x_v.min() + x_v.max()) / 2)
+        y_mid = float((y_v.min() + y_v.max()) / 2)
+        _, lat_mid = utm_to_latlon(
+            np.array([x_mid]), np.array([y_mid]),
+            detect_crs_epsg(ds),
+        )
+        lat_deg = float(lat_mid[0])
+        return (
+            dy_m / 111_320.0,                                          # lat_step
+            dx_m / (111_320.0 * np.cos(np.radians(lat_deg))),         # lon_step
+        )
+
+    @reactive.Calc
     def basemap_metric_key() -> str:
         """Return the selected internal metric key (dropdown value is already the key)."""
         return input.basemap_metric_label()
@@ -559,6 +585,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             tile_svc    = input.basemap_type()
             opacity     = float(input.metric_opacity())
             coords      = selected_coords()
+            nat_lat_step, nat_lon_step = native_pixel_step()
 
         m = make_leaflet_map(
             z=z,
@@ -569,6 +596,8 @@ def server(input: Inputs, output: Outputs, session: Session):
             metric_opacity=opacity,
             zmin=zmin,
             zmax=zmax,
+            native_lat_step=nat_lat_step,
+            native_lon_step=nat_lon_step,
         )
 
         # Show pixel marker if a pixel is already selected (e.g. region switch)
