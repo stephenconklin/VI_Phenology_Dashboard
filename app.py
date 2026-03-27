@@ -209,7 +209,7 @@ app_ui = ui.page_sidebar(
 
         _source_warning,
 
-        width=310,
+        width=420,
         bg="#f4f7f4",
     ),
 
