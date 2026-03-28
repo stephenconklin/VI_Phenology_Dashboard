@@ -100,11 +100,35 @@ FAST_BASEMAP_METRICS: dict[str, str] = {
 # Per-pixel metric computation defaults
 # ---------------------------------------------------------------------------
 
+'''
+min_valid_obs = 20
+Gate: if fewer than 20 valid observations exist across the full (year-filtered)
+time series, all outputs return NaN/empty — no plots, no metrics
+
+min_valid_obs_per_year = 5	
+Per-year gate: years with fewer than 5 valid obs are excluded from the Annual Cycles,
+Metric Trends, and Phenology Scatter tabs (they skip year-level statistics)
+
+peak_prominence = 0.05
+Controls which peaks are detected in the smoothed curve — affects n_peaks_mean,
+peak_separation_mean, relative_peak_amplitude_mean, valley_depth_mean shown in
+the Metric Trends tab and sidebar
+
+peak_min_distance_days = 45
+Minimum spacing between detected peaks — same metrics as above
+
+season_threshold = 0.20
+Fractional threshold (20% of the floor→ceiling amplitude) used to define season
+start/end — drives season_length_mean/std and the green-up rate
+
+The Raw VI tab (raw scatter + Whittaker smoothed line) is unaffected by these settings — it shows all observations regardless. The other three tabs and the sidebar metrics table are all gated and shaped by these values.
+'''
+
 PIXEL_METRIC_CONFIG: dict = {
     "vi_min": VI_VALID_RANGE["NDVI"][0],
     "vi_max": VI_VALID_RANGE["NDVI"][1],
-    "min_valid_obs": 20,
-    "min_valid_obs_per_year": 5,
+    "min_valid_obs": 0,
+    "min_valid_obs_per_year": 0,
     "peak_prominence": 0.05,
     "peak_min_distance_days": 45,
     "season_threshold": 0.20,

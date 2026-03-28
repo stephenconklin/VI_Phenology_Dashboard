@@ -1,11 +1,12 @@
-# VI Phenology Dashboard — Claude Code Context
+# Bioscape Phenology Dashboard — Claude Code Context
 
 ## Project Overview
 
 Interactive Shiny for Python dashboard for exploring vegetation index (VI) phenology
 datacubes from the BioSCape / LVIS South Africa flight campaign.  Lets users select
-a flight-box region, view a spatial metric basemap, click any 30 m pixel, and instantly
-see its Whittaker-smoothed VI time series plus 19 per-pixel phenological metrics.
+a flight-box region (via dropdown or by clicking a shapefile polygon), view a spatial
+metric basemap, click any 30 m pixel, and instantly see its Whittaker-smoothed VI
+time series plus 19 per-pixel phenological metrics.
 
 ## Data
 
@@ -54,6 +55,26 @@ extraction.  The largest file (G5_14) is 2.6 GB compressed / ~23 GB decompressed
   every downstream reactive reads from here, never from the raw pixel series
 - `pixel_date_cache()` — rebuilds date metadata from the clipped time window so the
   Whittaker grid is sized exactly to the selected years (no extrapolation)
+- `_sf_select_region` — `reactive.Value[str | None]`; set by the GeoJSON `on_click`
+  callback (non-reactive context); a `@reactive.Effect` picks it up and calls
+  `ui.update_select` in a proper reactive context
+- `_sf_notify` — `reactive.Value[str | None]`; same pattern for no-data warnings
+
+### Shapefile click → region navigation
+- On initial app load the map zooms to the union bounding box of all configured
+  shapefiles (`_SHAPEFILE_OVERVIEW_BOUNDS`, computed at startup from stdlib JSON).
+- Clicking any `LVIS_Flightboxes.geojson` polygon navigates to the matching region
+  (matched by `box_nr` field against `ALL_REGIONS` keys).  Clicking a polygon with
+  no matching datacube shows a warning notification.
+- Clicking the *currently active* region's polygon is silently ignored so it never
+  re-triggers a region reload while the user is selecting pixels.
+- All other shapefiles (e.g. HLS tiles) are display-only — no click handler.
+- `_on_interaction` (map-level pixel click) checks `_sf_select_region() is not None`
+  at the top and bails out early when a region change is already queued; this prevents
+  spurious phenology computations and concurrent image-overlay updates that can
+  destabilise Leaflet rendering.
+- `_set_map_view(m, bounds, zoom_offset)` sets `m.center` / `m.zoom` as widget traits
+  (not `fit_bounds()` which uses `send()` and requires an open comm channel).
 
 ### Three-tier basemap load order
 1. Disk `.npz` cache (< 1 s) — pre-populate with `python tools/cache_basemaps.py --all`

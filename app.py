@@ -114,6 +114,82 @@ except FileNotFoundError as _e:
     REGION_CHOICES = {}
     _STARTUP_ERROR = str(_e)
 
+
+# ---------------------------------------------------------------------------
+# Shapefile overview bounds — used for the initial map view
+# ---------------------------------------------------------------------------
+
+def _compute_shapefile_overview_bounds(shapefile_paths_str: str | None) -> list | None:
+    """
+    Parse all configured shapefile GeoJSON files and return
+    [[south, west], [north, east]] covering the union of all features.
+    Uses stdlib json only — no geopandas required.
+    """
+    if not shapefile_paths_str:
+        return None
+    import json
+    from pathlib import Path as _P
+
+    lats: list[float] = []
+    lons: list[float] = []
+
+    def _walk(obj):
+        if not obj:
+            return
+        if isinstance(obj, list):
+            first = obj[0] if obj else None
+            if isinstance(first, (int, float)):
+                lons.append(float(obj[0]))
+                lats.append(float(obj[1]))
+            else:
+                for item in obj:
+                    _walk(item)
+
+    for path in shapefile_paths_str.split():
+        p = _P(path)
+        if not p.exists():
+            continue
+        try:
+            with open(p) as f:
+                gj = json.load(f)
+            for feat in gj.get("features", []):
+                geom = feat.get("geometry") or {}
+                _walk(geom.get("coordinates", []))
+        except Exception:
+            pass
+
+    if not lats:
+        return None
+    pad = 0.02
+    return [
+        [min(lats) - pad, min(lons) - pad],
+        [max(lats) + pad, max(lons) + pad],
+    ]
+
+
+_SHAPEFILE_OVERVIEW_BOUNDS: list | None = _compute_shapefile_overview_bounds(SHAPEFILE_PATHS)
+
+
+def _set_map_view(m, bounds: list, zoom_offset: int = 0) -> None:
+    """
+    Set ipyleaflet Map center and zoom to fit [[south, west], [north, east]].
+    Sets traits directly so the values are included in the initial widget
+    state sent to the browser (fit_bounds() uses send() which requires an
+    already-open comm channel and would be lost on a freshly created widget).
+
+    zoom_offset: positive values zoom in tighter, negative values zoom out.
+    """
+    (south, west), (north, east) = bounds
+    lat_range = north - south
+    lon_range = east  - west
+    m.center = [(south + north) / 2.0, (west + east) / 2.0]
+    extent = max(lat_range, lon_range)
+    if extent > 0:
+        m.zoom = max(5, min(15, int(np.log2(360.0 / extent)) - 1 + zoom_offset))
+    else:
+        m.zoom = 10
+
+
 # Basemap metric dropdown choices — values are internal metric keys.
 # Groups: "Quick metrics" (always available on-the-fly) +
 #         "Phenology metrics" (requires precomputed pixel_metrics.nc).
@@ -176,8 +252,6 @@ _source_warning = "" if source_available() else (
 
 app_ui = ui.page_sidebar(
     ui.sidebar(
-        ui.h5("VI Phenology Dashboard", style="margin-bottom:4px"),
-        ui.tags.hr(style="margin:4px 0"),
 
         # --- Region selector ---
         ui.input_select(
@@ -371,7 +445,7 @@ app_ui = ui.page_sidebar(
         full_screen=True,
     ),
 
-    title="VI Phenology Dashboard",
+    title="BioSCape Phenology Dashboard",
     fillable=True,
 )
 
@@ -407,6 +481,22 @@ def server(input: Inputs, output: Outputs, session: Session):
     # Non-reactive per-session reference to the current basemap FigureWidget.
     # Set by basemap_widget on (re-)render; read by _update_basemap_inplace.
     _fig_ref: list = [None]
+
+    # -----------------------------------------------------------------------
+    # Shapefile region-selection state
+    # -----------------------------------------------------------------------
+
+    # Reactive trigger: shapefile click sets this to the target region_id.
+    # A reactive.Effect picks it up and calls ui.update_select in context.
+    _sf_select_region: reactive.Value[str | None] = reactive.Value(None)
+    # Reactive trigger: shapefile click sets this to a warning message.
+    _sf_notify: reactive.Value[str | None]        = reactive.Value(None)
+    # Non-reactive: tracks which region is currently loaded so the click
+    # handler can ignore clicks on the already-active region.
+    _current_region: list = [""]
+    # Non-reactive: True only on the very first basemap_widget render per
+    # session — used to show the full shapefile overview on startup.
+    _initial_render: list = [True]
 
     # -----------------------------------------------------------------------
     # Reactive calculations — cached, invalidated only when deps change
@@ -698,6 +788,24 @@ def server(input: Inputs, output: Outputs, session: Session):
     # Basemap widget
     # -----------------------------------------------------------------------
 
+    @reactive.Effect
+    def _apply_sf_region_select():
+        """Apply a region change triggered by a shapefile polygon click."""
+        req = _sf_select_region()
+        if req is None:
+            return
+        ui.update_select("region", selected=req, session=session)
+        _sf_select_region.set(None)
+
+    @reactive.Effect
+    def _show_sf_notification():
+        """Surface a no-data warning from a shapefile polygon click."""
+        msg = _sf_notify()
+        if msg is None:
+            return
+        ui.notification_show(msg, type="warning", duration=5)
+        _sf_notify.set(None)
+
     @render_widget
     def basemap_widget():
         """
@@ -718,6 +826,25 @@ def server(input: Inputs, output: Outputs, session: Session):
             opacity     = float(input.metric_opacity())
             coords      = selected_coords()
             nat_lat_step, nat_lon_step = native_pixel_step()
+            # Read and reset view-state flags inside isolate (no reactive deps).
+            is_initial        = _initial_render[0]
+            _initial_render[0] = False
+            _current_region[0] = region
+
+        # Shapefile click handler — always attached; ignores the active region
+        # so pixel clicks on the loaded datacube never re-trigger region load.
+        def sf_click_cb(**kwargs):
+            feature = kwargs.get("feature") or {}
+            props   = feature.get("properties") or kwargs.get("properties") or {}
+            box_nr  = str(props.get("box_nr", "")).strip()
+            if box_nr == _current_region[0]:
+                return  # already in this region — ignore
+            if box_nr in ALL_REGIONS:
+                _sf_select_region.set(box_nr)
+            elif box_nr:
+                _sf_notify.set(f"No datacube for flight box '{box_nr}'.")
+            else:
+                _sf_notify.set("Could not identify flight box from click.")
 
         m = make_leaflet_map(
             z=z,
@@ -732,7 +859,20 @@ def server(input: Inputs, output: Outputs, session: Session):
             native_lon_step=nat_lon_step,
             shapefile_paths=SHAPEFILE_PATHS,
             shapefile_label_fields=SHAPEFILE_LABEL_FIELDS,
+            shapefile_on_click=sf_click_cb,
         )
+
+        # Zoom: initial load → full shapefile overview; region change → data extent.
+        # _set_map_view sets center/zoom as widget traits so they are included in
+        # the initial state sent to the browser (fit_bounds uses send() which
+        # requires an already-open comm and would be dropped on a fresh widget).
+        if is_initial and _SHAPEFILE_OVERVIEW_BOUNDS is not None:
+            _set_map_view(m, _SHAPEFILE_OVERVIEW_BOUNDS, zoom_offset=2)
+        else:
+            _set_map_view(m, [
+                [float(lat.min()), float(lon.min())],
+                [float(lat.max()), float(lon.max())],
+            ], zoom_offset=2.75)
 
         # Show pixel marker if a pixel is already selected (e.g. region switch)
         if coords is not None:
@@ -747,6 +887,12 @@ def server(input: Inputs, output: Outputs, session: Session):
             click_lat = float(coordinates[0])
             click_lon = float(coordinates[1])
             with reactive.isolate():
+                # If sf_click_cb already claimed this click for a region change,
+                # skip pixel selection entirely — prevents spurious phenology
+                # computation and concurrent image-overlay updates that destabilise
+                # Leaflet rendering.
+                if _sf_select_region() is not None:
+                    return
                 ds = active_dataset()
                 _z, lon, lat = basemap_data()
             # Ignore clicks outside the current region's data extent

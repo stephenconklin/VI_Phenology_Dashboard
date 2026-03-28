@@ -476,6 +476,7 @@ def make_leaflet_map(
     native_lon_step: float | None = None,
     shapefile_paths: str | None = None,
     shapefile_label_fields: str = "NAME",
+    shapefile_on_click=None,
 ) -> ipl.Map:
     """
     Build an ipyleaflet Map with:
@@ -550,7 +551,9 @@ def make_leaflet_map(
         fields = shapefile_label_fields.split()
         for i, path in enumerate(paths):
             field = fields[i] if i < len(fields) else fields[-1]
-            add_shapefile_overlay(m, path, label_field=field)
+            # Only the first shapefile (LVIS_Flightboxes) gets region-select clicks
+            cb = shapefile_on_click if i == 0 else None
+            add_shapefile_overlay(m, path, label_field=field, on_feature_click=cb)
 
     return m
 
@@ -619,6 +622,7 @@ def add_shapefile_overlay(
     m: ipl.Map,
     shapefile_path,
     label_field: str = "NAME",
+    on_feature_click=None,
 ) -> None:
     """
     Load a shapefile and add it to an existing ipyleaflet Map.
@@ -667,8 +671,12 @@ def add_shapefile_overlay(
         name="Shapefile overlay",
     )
     m.add_layer(geojson_layer)
+    if on_feature_click is not None:
+        geojson_layer.on_click(on_feature_click)
 
     # --- Text labels via Marker + DivIcon at each centroid ---
+    # icon_size=[1,1] (non-zero) lets Leaflet properly track viewport inclusion;
+    # transform:translate(-50%,-50%) centres the text div on the marker point.
     label_markers = []
     for _, row in gdf.iterrows():
         label_text = str(row.get(label_field, "")) if label_field in gdf.columns else ""
@@ -676,15 +684,13 @@ def add_shapefile_overlay(
             continue
         centroid = row.geometry.centroid
         icon = ipl.DivIcon(
-            html=f'<div style="'
-                 f'color:#ffffff;'
-                 f'font-size:16px;'
-                 f'font-weight:bold;'
-                 f'text-shadow:0 0 3px #000,0 0 3px #000;'
-                 f'white-space:nowrap;'
-                 f'pointer-events:none;'
-                 f'">{label_text}</div>',
-            icon_size=[0, 0],
+            html=(
+                f'<div style="color:#ffffff;font-size:14px;font-weight:bold;'
+                f'text-shadow:0 0 3px #000,0 0 3px #000;white-space:nowrap;'
+                f'pointer-events:none;transform:translate(-50%,-50%)">'
+                f'{label_text}</div>'
+            ),
+            icon_size=[1, 1],
             icon_anchor=[0, 0],
         )
         marker = ipl.Marker(

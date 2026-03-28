@@ -1,4 +1,4 @@
-# VI Phenology Dashboard
+# Bioscape Phenology Dashboard
 
 An interactive Shiny for Python dashboard for exploring vegetation index (VI)
 phenology datacubes from the BioSCape / LVIS flight campaign.
@@ -17,9 +17,10 @@ compute and visualise its full Whittaker-smoothed phenology time series plus
 | Feature | Description |
 |---|---|
 | Region selector | Dropdown of all discovered regions; supports NDVI, EVI2, NIRv datacubes |
-| Spatial basemap | ipyleaflet map with metric colour overlay on satellite imagery |
+| Shapefile click navigation | Click any LVIS flight-box polygon to navigate directly to that region; matched by `box_nr` field; no-data boxes show a warning |
+| Spatial basemap | ipyleaflet map with metric colour overlay on satellite imagery; initial view zooms to full shapefile extent, then zooms to the selected region's data on each selection |
 | Shapefile overlays | Display one or more vector overlays (shapefiles / GeoJSON) with labels; toggled via sidebar checkboxes |
-| Click-to-select | Click any pixel on the map to load its time series; clicks outside the data extent are ignored |
+| Click-to-select | Click any pixel on the map to load its time series; clicks outside the data extent are ignored; shapefile polygon clicks are intercepted for region navigation and never treated as pixel selections |
 | Time series plot | Raw VI observations + Whittaker-smoothed curve (4 tabs) |
 | Data range filter | Restrict the analysis to a VI amplitude sub-range — affects all plots and metrics |
 | Year range slider | Double-handle slider to restrict analysis to a calendar year window — clips observations, smoothing, and all plots to the selected years |
