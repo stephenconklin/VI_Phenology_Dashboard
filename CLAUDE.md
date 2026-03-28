@@ -14,7 +14,7 @@ time series plus 19 per-pixel phenological metrics.
 Override with `export VI_DATACUBE_ROOT=/your/path` or edit `DATACUBE_ROOT` in `config.py`.
 
 **Supported VIs (auto-detected from filename):** NDVI, EVI2, NIRv
-**CRS:** UTM Zone 34S (EPSG:32734); reprojected to WGS84 for display
+**CRS:** UTM Zone 34S (EPSG:32734); reprojected to Web Mercator (EPSG:3857) for display
 **18 flight-box regions** (G5_1 – G5_25, subset); ~30 m, 2016–2019
 
 ## Running
@@ -52,7 +52,10 @@ extraction.  The largest file (G5_14) is 2.6 GB compressed / ~23 GB decompressed
 - `effective_selected_idx` — `@reactive.Calc` that returns `(yi, xi)` only when the
   stored region matches the current input; single choke-point for stale-selection detection
 - `narrowed_timeseries()` — applies both the VI amplitude filter and year range filter;
-  every downstream reactive reads from here, never from the raw pixel series
+  every downstream reactive reads from here, never from the raw pixel series.
+  The colorscale amplitude filter is only applied when the active basemap metric is
+  VI-scaled (one of the four quick metrics); phenology metrics (DOY, days, etc.) have
+  colorscale values in different units and must not gate VI observations.
 - `pixel_date_cache()` — rebuilds date metadata from the clipped time window so the
   Whittaker grid is sized exactly to the selected years (no extrapolation)
 - `_sf_select_region` — `reactive.Value[str | None]`; set by the GeoJSON `on_click`
@@ -75,6 +78,17 @@ extraction.  The largest file (G5_14) is 2.6 GB compressed / ~23 GB decompressed
   destabilise Leaflet rendering.
 - `_set_map_view(m, bounds, zoom_offset)` sets `m.center` / `m.zoom` as widget traits
   (not `fit_bounds()` which uses `send()` and requires an open comm channel).
+
+### Basemap reprojection pipeline
+- Source data is in UTM Zone 34S (EPSG:32734), a rotated grid relative to geographic north.
+- `_regrid_to_mercator()` in `datacube_io.py` reprojects to a regular Web Mercator (EPSG:3857)
+  grid via nearest-neighbour lookup (pyproj EPSG:3857 → EPSG:32734, then scipy
+  `RegularGridInterpolator`).  WGS84 lat/lon is derived algebraically from the Mercator grid
+  for the `ImageOverlay` bounds — no extra transform step.
+- Coarsening factors (`cf_y`, `cf_x`) are computed independently per axis so each dimension
+  stays within `BASEMAP_MAX_DIM` without degrading the finer axis.
+- The returned `(z, lon, lat)` arrays are stored in `.npz` caches; loading a cache skips
+  both the Dask compute and the reprojection entirely.
 
 ### Three-tier basemap load order
 1. Disk `.npz` cache (< 1 s) — pre-populate with `python tools/cache_basemaps.py --all`

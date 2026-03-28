@@ -378,10 +378,10 @@ def build_date_cache_from_dates(obs_dates: np.ndarray) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# WGS84 regridding helper
+# Web Mercator regridding helper
 # ---------------------------------------------------------------------------
 
-def _regrid_to_wgs84(
+def _regrid_to_mercator(
     z: np.ndarray,
     lon_2d: np.ndarray,
     lat_2d: np.ndarray,
@@ -390,32 +390,29 @@ def _regrid_to_wgs84(
     src_epsg: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Re-project z values from a regular UTM grid onto a regular WGS84 grid.
+    Re-project z from a regular UTM grid onto a regular Web Mercator
+    (EPSG:3857) grid, returning WGS84 lat/lon of those grid cells.
 
-    Problem
-    -------
-    go.Heatmap uses only lon[0,:] and lat[:,0] as axis vectors, implicitly
-    assuming a purely rectangular WGS84 grid.  UTM Zone 34S grids are rotated
-    slightly relative to geographic north, so each row has a different longitude
-    offset and each column a different latitude offset.  Passing the raw UTM
-    meshgrid lon/lat to Plotly causes visible misalignment against any WGS84
-    basemap.
+    Working natively in Mercator metres means every PNG pixel maps to an
+    equal-area Mercator cell, which exactly matches how Leaflet's
+    ImageOverlay stretches the image — no intermediate WGS84 step required.
 
-    Solution
-    --------
-    1. Set up a RegularGridInterpolator on the original UTM grid.
-    2. Define a regular WGS84 target grid with the same pixel count.
-    3. Convert each target (lon, lat) back to UTM and look up its z-value.
-
-    The returned arrays are truly regular: lon_grid[i,j] == lon_grid[0,j]
-    and lat_grid[i,j] == lat_grid[i,0] for all i, j.
+    Steps
+    -----
+    1. Sort the UTM source grid and build a RegularGridInterpolator.
+    2. Convert the data extent (from lon_2d / lat_2d) to Mercator bounds.
+    3. Define a regular target grid in Mercator metres (merc_x, merc_y).
+    4. Transform each Mercator cell centre to UTM via pyproj (EPSG:3857 →
+       src_epsg) and nearest-neighbour look up from the interpolator.
+    5. Convert the Mercator grid back to WGS84 lat/lon for the ImageOverlay
+       bounds; these are exact because Mercator ↔ WGS84 is lossless.
     """
     from scipy.interpolate import RegularGridInterpolator
 
+    R = 6_378_137.0  # WGS84 semi-major axis (metres)
     ny, nx = z.shape
 
-    # RegularGridInterpolator requires strictly increasing axis arrays.
-    # y_c (UTM northing) is often decreasing in raster convention.
+    # Sort UTM axes — RegularGridInterpolator requires strictly increasing.
     y_order = np.argsort(y_c)
     x_order = np.argsort(x_c)
     z_sorted = z[y_order, :][:, x_order]
@@ -428,29 +425,30 @@ def _regrid_to_wgs84(
         fill_value=np.nan,
     )
 
-    # Regular WGS84 target grid — lon increases west→east (linear in Mercator-x).
-    lon_reg = np.linspace(float(lon_2d.min()), float(lon_2d.max()), nx)
+    # Convert data extent to Mercator bounds.
+    lon_min, lon_max = float(lon_2d.min()), float(lon_2d.max())
+    lat_min, lat_max = float(lat_2d.min()), float(lat_2d.max())
+    merc_x_min = R * np.radians(lon_min)
+    merc_x_max = R * np.radians(lon_max)
+    merc_y_min = R * np.log(np.tan(np.pi / 4 + np.radians(lat_min) / 2))
+    merc_y_max = R * np.log(np.tan(np.pi / 4 + np.radians(lat_max) / 2))
 
-    # Rows evenly spaced in Mercator-y so that Leaflet's linear ImageOverlay
-    # stretch is geometrically exact (eliminates ~50 m mid-region drift).
-    R         = 6_378_137.0  # WGS84 semi-major axis
-    lat_min_r = np.radians(float(lat_2d.min()))
-    lat_max_r = np.radians(float(lat_2d.max()))
-    merc_y    = np.linspace(
-        R * np.log(np.tan(np.pi / 4 + lat_min_r / 2)),
-        R * np.log(np.tan(np.pi / 4 + lat_max_r / 2)),
-        ny,
-    )
-    lat_reg = 2.0 * np.degrees(np.arctan(np.exp(merc_y / R))) - 90.0
-    lon_grid, lat_grid = np.meshgrid(lon_reg, lat_reg)
+    # Regular Mercator target grid — equal-area cells in both axes.
+    merc_x_reg = np.linspace(merc_x_min, merc_x_max, nx)
+    merc_y_reg = np.linspace(merc_y_min, merc_y_max, ny)
+    merc_x_grid, merc_y_grid = np.meshgrid(merc_x_reg, merc_y_reg)
 
-    # Convert target WGS84 positions → UTM for the interpolator lookup.
-    tf_inv = _get_transformer(TARGET_CRS_EPSG, src_epsg)
-    x_tgt, y_tgt = tf_inv.transform(lon_grid.ravel(), lat_grid.ravel())
+    # Transform Mercator → UTM for the nearest-neighbour lookup.
+    tf = _get_transformer(3857, src_epsg)
+    x_tgt, y_tgt = tf.transform(merc_x_grid.ravel(), merc_y_grid.ravel())
 
     z_reg = interp(
-        np.column_stack([y_tgt, x_tgt])   # interpolator axis order: (northing, easting)
+        np.column_stack([y_tgt, x_tgt])  # interpolator axis order: (northing, easting)
     ).reshape(ny, nx)
+
+    # Derive WGS84 lat/lon from the Mercator grid for ImageOverlay bounds.
+    lon_grid = np.degrees(merc_x_grid / R)
+    lat_grid = 2.0 * np.degrees(np.arctan(np.exp(merc_y_grid / R))) - 90.0
 
     return z_reg, lon_grid, lat_grid
 
@@ -538,12 +536,11 @@ def compute_basemap_metric(
     # per tile rather than a multi-chunk aggregation.
     da = da.chunk({"time": -1})
 
-    # Compute coarsening factors to stay within max_dim × max_dim.
-    # Equalize so both axes use the same factor → square display pixels
-    # (unequal factors produce elongated rectangles for tall/narrow regions).
+    # Compute independent coarsening factors to stay within max_dim per axis.
+    # Using per-axis factors preserves the native spatial density of each
+    # dimension rather than degrading both to the coarser of the two.
     cf_y = max(1, ny // max_dim)
     cf_x = max(1, nx // max_dim)
-    cf_y = cf_x = max(cf_y, cf_x)
 
     # Coarsen spatially first (still lazy), then reduce over time
     da_c = da.coarsen(y=cf_y, x=cf_x, boundary="trim").mean()
@@ -570,7 +567,7 @@ def compute_basemap_metric(
     lon_2d = lon_2d.reshape(yy.shape)
     lat_2d = lat_2d.reshape(yy.shape)
 
-    return _regrid_to_wgs84(z, lon_2d, lat_2d, x_c, y_c, src_epsg)
+    return _regrid_to_mercator(z, lon_2d, lat_2d, x_c, y_c, src_epsg)
 
 
 def load_metrics_for_basemap(
@@ -586,7 +583,8 @@ def load_metrics_for_basemap(
     Uses BASEMAP_MAX_DIM_PRECOMPUTED (default 2 000) rather than the smaller
     on-the-fly limit so that all current LVIS regions (≤ 2 222 × 409 px)
     are displayed at native 30 m resolution without any coarsening.
-    Coarsening factors are equalised to keep display pixels square.
+    Independent per-axis coarsening factors preserve the native spatial
+    density of each dimension.
     """
     with xr.open_dataset(str(metrics_path), mask_and_scale=True) as ds_m:
         if metric not in ds_m:
@@ -598,8 +596,7 @@ def load_metrics_for_basemap(
         ny, nx = da.sizes["y"], da.sizes["x"]
         cf_y = max(1, ny // max_dim)
         cf_x = max(1, nx // max_dim)
-        cf_y = cf_x = max(cf_y, cf_x)   # equalize → square display pixels
-        if cf_y > 1:
+        if cf_y > 1 or cf_x > 1:
             da = da.coarsen(y=cf_y, x=cf_x, boundary="trim").mean()
         z = da.values
         x_c = da["x"].values
@@ -609,7 +606,7 @@ def load_metrics_for_basemap(
     lon_2d, lat_2d = utm_to_latlon(xx.ravel(), yy.ravel(), src_epsg)
     lon_2d = lon_2d.reshape(yy.shape)
     lat_2d = lat_2d.reshape(yy.shape)
-    return _regrid_to_wgs84(z, lon_2d, lat_2d, x_c, y_c, src_epsg)
+    return _regrid_to_mercator(z, lon_2d, lat_2d, x_c, y_c, src_epsg)
 
 
 # ---------------------------------------------------------------------------

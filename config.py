@@ -78,13 +78,15 @@ LAMBDA_STEP: int = 10
 # ---------------------------------------------------------------------------
 
 # Maximum pixel count per axis for the on-the-fly Dask basemap path.
-# Kept small for performance (Dask compute over full time axis).
-BASEMAP_MAX_DIM: int = 500
+# Matched to BASEMAP_MAX_DIM_PRECOMPUTED so that coarsening factors are
+# identical on both paths — keeps display pixels near-square at native
+# 30 m resolution for all current LVIS regions (largest: G5_14, 2 222 × 409).
+# The one-time cost of the larger Dask compute is absorbed by the disk cache;
+# subsequent loads are always instant regardless of this value.
+BASEMAP_MAX_DIM: int = 2000
 
 # Maximum pixel count per axis for the precomputed pixel_metrics.nc path.
-# Data is already reduced to 2D so no Dask cost — use a higher limit to
-# display at or near native 30 m resolution for all current LVIS regions
-# (largest is G5_14 at 2 222 × 409 px).
+# Data is already reduced to 2D so no Dask cost.
 BASEMAP_MAX_DIM_PRECOMPUTED: int = 2000
 
 # Fast basemap metrics always available (no precomputed file required).

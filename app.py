@@ -675,11 +675,21 @@ def server(input: Inputs, output: Outputs, session: Session):
         (year_range_slider).  All smoothing and metric computation uses this
         rather than the full physical series, so that both filter controls
         genuinely affect the analysis.
+
+        The colorscale amplitude filter is only applied when the active basemap
+        metric is VI-scaled (one of the four quick metrics).  Phenology metrics
+        (e.g. DOY, season length in days) have colorscale values in completely
+        different units, so applying them as a VI amplitude filter would mask
+        out all valid observations.
         """
         ts = pixel_timeseries()
         if ts is None:
             return None
-        zmin, zmax = colorscale_limits()
+        _fast_keys = set(FAST_BASEMAP_METRICS.values())
+        if basemap_metric_key() in _fast_keys:
+            zmin, zmax = colorscale_limits()
+        else:
+            zmin, zmax = None, None
         mask = ts.valid_mask.copy()
         if zmin is not None:
             mask &= ts.raw_vi >= float(zmin)
@@ -734,14 +744,19 @@ def server(input: Inputs, output: Outputs, session: Session):
         physical VI valid range and the active data range (colorscale_limits).
         Ensures observation masking and curve clipping inside the Whittaker
         smoother match the data range filter applied to the time series.
+
+        Colorscale limits are only used when the basemap metric is VI-scaled;
+        phenology metrics (DOY, days, etc.) must not constrain the VI bounds.
         """
         vi = region_paths().vi_var
         vi_min, vi_max = VI_VALID_RANGE.get(vi, VI_VALID_RANGE[DEFAULT_VI_VAR])
-        zmin, zmax = colorscale_limits()
-        if zmin is not None:
-            vi_min = max(vi_min, float(zmin))
-        if zmax is not None:
-            vi_max = min(vi_max, float(zmax))
+        _fast_keys = set(FAST_BASEMAP_METRICS.values())
+        if basemap_metric_key() in _fast_keys:
+            zmin, zmax = colorscale_limits()
+            if zmin is not None:
+                vi_min = max(vi_min, float(zmin))
+            if zmax is not None:
+                vi_max = min(vi_max, float(zmax))
         return {**PIXEL_METRIC_CONFIG, "vi_min": vi_min, "vi_max": vi_max}
 
     @reactive.Calc
