@@ -408,6 +408,17 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--start-from",
+        dest="start_from",
+        metavar="ID",
+        default=None,
+        help=(
+            "When used with --all, skip all regions that appear before ID "
+            "in the discovered list.  E.g. --all --start-from G5_8"
+        ),
+    )
+
+    parser.add_argument(
         "--lambda",
         dest="lam",
         type=float,
@@ -489,8 +500,25 @@ def main() -> None:
         )
         sys.exit(1)
 
+    if args.start_from and not args.all:
+        parser.error("--start-from can only be used with --all")
+
     if args.all:
         targets = list(all_regions.items())
+        if args.start_from:
+            if args.start_from not in all_regions:
+                available = ", ".join(all_regions)
+                print(
+                    f"--start-from region {args.start_from!r} not found.\n"
+                    f"Available regions: {available}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            region_keys = list(all_regions.keys())
+            start_idx = region_keys.index(args.start_from)
+            targets = targets[start_idx:]
+            print(f"  Starting from {args.start_from} "
+                  f"(skipping {start_idx} region(s))\n")
     else:
         if args.region not in all_regions:
             available = ", ".join(all_regions)

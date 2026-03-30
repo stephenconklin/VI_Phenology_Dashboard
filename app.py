@@ -445,7 +445,7 @@ app_ui = ui.page_sidebar(
         full_screen=True,
     ),
 
-    title="BioSCape Phenology Dashboard",
+    title="BioSCape Phenology Explorer",
     fillable=True,
 )
 

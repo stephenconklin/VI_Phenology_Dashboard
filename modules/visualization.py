@@ -359,6 +359,12 @@ LEAFLET_TILE_SERVICES: dict[str, dict] = {
         "max_zoom":    19,
         "label":       "OpenStreetMap",
     },
+    "None": {
+        "url":         "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "attribution": "",
+        "max_zoom":    19,
+        "label":       "No Basemap",
+    },
 }
 
 
@@ -502,12 +508,17 @@ def make_leaflet_map(
     lon_step = (lon_max - lon_min) / max(nx - 1, 1)
     lat_step = (lat_max - lat_min) / max(ny - 1, 1)
 
-    svc = LEAFLET_TILE_SERVICES.get(tile_service, LEAFLET_TILE_SERVICES["World_Imagery"])
+    _no_basemap = tile_service == "None"
+    svc = LEAFLET_TILE_SERVICES.get(
+        tile_service if not _no_basemap else "World_Imagery",
+        LEAFLET_TILE_SERVICES["World_Imagery"],
+    )
     tile_layer = ipl.TileLayer(
         url=svc["url"],
         attribution=svc["attribution"],
         max_zoom=svc.get("max_zoom", 18),
         name="Basemap",
+        opacity=0.0 if _no_basemap else 1.0,
     )
 
     image_overlay = ipl.ImageOverlay(
@@ -590,11 +601,15 @@ def update_leaflet_map(
     # the changed property deltas to the browser, Leaflet reloads tiles
     # automatically, and layer ordering is never disturbed.
     if tile_service is not None:
-        svc = LEAFLET_TILE_SERVICES.get(tile_service, LEAFLET_TILE_SERVICES["World_Imagery"])
-        if m._tile_layer.url != svc["url"]:
-            m._tile_layer.url         = svc["url"]
-            m._tile_layer.attribution = svc["attribution"]
-            m._tile_layer.max_zoom    = svc.get("max_zoom", 18)
+        if tile_service == "None":
+            m._tile_layer.opacity = 0.0
+        else:
+            svc = LEAFLET_TILE_SERVICES.get(tile_service, LEAFLET_TILE_SERVICES["World_Imagery"])
+            if m._tile_layer.url != svc["url"]:
+                m._tile_layer.url         = svc["url"]
+                m._tile_layer.attribution = svc["attribution"]
+                m._tile_layer.max_zoom    = svc.get("max_zoom", 18)
+            m._tile_layer.opacity = 1.0
 
     # Show / hide the selected-pixel rectangle.
     # Bounds are sized to exactly one pixel footprint using the step sizes

@@ -1,4 +1,4 @@
-# Bioscape Phenology Dashboard — Claude Code Context
+# BioSCape Phenology Explorer — Claude Code Context
 
 ## Project Overview
 
