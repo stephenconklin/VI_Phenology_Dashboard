@@ -38,6 +38,7 @@ from config import (
     LAMBDA_STEP,
     METRIC_GROUPS,
     METRIC_LABELS,
+    NONNEGATIVE_METRICS,
     PIXEL_METRIC_CONFIG,
     SHAPEFILE_LABEL_FIELDS,
     SHAPEFILE_PATHS,
@@ -445,6 +446,21 @@ app_ui = ui.page_sidebar(
         full_screen=True,
     ),
 
+    ui.tags.div(
+        "Stephen Conklin — ",
+        ui.tags.a(
+            "github.com/stephenconklin/VI_Phenology_Dashboard",
+            href="https://github.com/stephenconklin/VI_Phenology_Dashboard",
+            target="_blank",
+            style="color:inherit;",
+        ),
+        style=(
+            "position:fixed;bottom:6px;right:10px;"
+            "font-size:0.7rem;opacity:0.55;pointer-events:auto;"
+            "z-index:9999;"
+        ),
+    ),
+
     title="BioSCape Phenology Explorer",
     fillable=True,
 )
@@ -593,7 +609,10 @@ def server(input: Inputs, output: Outputs, session: Session):
         cache = basemap_cache_path(paths.nc_path, metric, BASEMAP_MAX_DIM)
         hit = load_basemap_cache(cache)
         if hit is not None:
-            return hit
+            z, lon, lat = hit
+            if metric == "data_coverage":
+                z[z == 0.0] = np.nan
+            return z, lon, lat
 
         # Slow path: Dask compute with progress indicator
         with ui.Progress(min=0, max=3) as p:
@@ -603,7 +622,10 @@ def server(input: Inputs, output: Outputs, session: Session):
             p.set(2, detail="Saving cache…")
             save_basemap_cache(cache, *result)
             p.set(3)
-        return result
+        z, lon, lat = result
+        if metric == "data_coverage":
+            z[z == 0.0] = np.nan
+        return z, lon, lat
 
     @reactive.Calc
     def colorscale_limits() -> tuple[float | None, float | None]:
@@ -620,7 +642,12 @@ def server(input: Inputs, output: Outputs, session: Session):
         z_mean = float(np.nanmean(z))
         z_std  = float(np.nanstd(z))
         n_sd   = {"1sd": 1, "2sd": 2, "3sd": 3}.get(sel, 2)
-        return z_mean - n_sd * z_std, z_mean + n_sd * z_std
+        zmin = z_mean - n_sd * z_std
+        zmax = z_mean + n_sd * z_std
+        metric = basemap_metric_key()
+        if metric in NONNEGATIVE_METRICS:
+            zmin = max(0.0, zmin)
+        return zmin, zmax
 
     @reactive.Calc
     def effective_selected_idx() -> tuple[int, int] | None:

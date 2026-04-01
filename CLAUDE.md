@@ -116,6 +116,18 @@ SHAPEFILE_LABEL_FIELDS = "box_nr Name"   # one per file; last reused if fewer th
 VI_VALID_RANGE["MYVI"] = (-0.2, 1.5)
 ```
 
+## Known Display Issues (Fixed)
+
+| Issue | Root cause | Fix |
+|---|---|---|
+| Season Length, Peak DOY std, Peak Separation showing ~-9.2e18 on basemap | xarray decodes variables with `units="days"` as `timedelta64`; float32 fill value overflows to int64 min | `decode_timedelta=False` in `load_metrics_for_basemap` (`modules/datacube_io.py`) |
+| Negative lower colorscale bound for non-negative metrics (DOY, days, counts) | `colorscale_limits()` returns `mean - N*std < 0` | Floor `zmin = max(0.0, zmin)` for `NONNEGATIVE_METRICS` in `app.py:colorscale_limits()` |
+| Std band shading extends below zero in annual metric trend plots | `lo = mean_val - std_val` unclamped | `lo = max(0.0, lo)` for `NONNEGATIVE_METRICS` in `modules/visualization.py` |
+| Data Coverage basemap shows full bounding box instead of flight strip only | `notnull().mean()` returns 0.0 (not NaN) for all-nodata pixels | `z[z == 0.0] = np.nan` applied after every basemap load path in `app.py:basemap_data()` and `modules/datacube_io.py:compute_basemap_metric()` |
+
+`NONNEGATIVE_METRICS` is defined in `config.py` — the frozenset of metrics bounded below by zero.
+Excluded (can be legitimately negative): `peak_ndvi_mean`, `integrated_ndvi_mean`, `floor_ndvi_mean`, `ceiling_ndvi_mean`.
+
 ## Coding Conventions
 
 - All configuration constants live in `config.py` — do not hardcode paths or thresholds elsewhere

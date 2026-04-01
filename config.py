@@ -129,7 +129,7 @@ The Raw VI tab (raw scatter + Whittaker smoothed line) is unaffected by these se
 PIXEL_METRIC_CONFIG: dict = {
     "vi_min": VI_VALID_RANGE["NDVI"][0],
     "vi_max": VI_VALID_RANGE["NDVI"][1],
-    "min_valid_obs": 0,
+    "min_valid_obs": 20,
     "min_valid_obs_per_year": 0,
     "peak_prominence": 0.05,
     "peak_min_distance_days": 45,
@@ -184,6 +184,29 @@ METRIC_LABELS: dict[str, tuple[str, str]] = {
     "relative_peak_amplitude_mean": ("Relative Peak Amplitude",      "ratio"),
     "valley_depth_mean":            ("Valley Depth (mean)",          "normalized"),
 }
+
+# Metrics whose values are physically bounded below by zero.
+# Used by colorscale_limits() to prevent SD-clipping from producing
+# a negative zmin (e.g. peak_doy_std mean=8, sd=10 → zmin = -12 days).
+# Excluded (can legitimately be negative): peak_ndvi_mean, integrated_ndvi_mean,
+# floor_ndvi_mean, ceiling_ndvi_mean (all NDVI-valued, vi_min = -0.1).
+NONNEGATIVE_METRICS: frozenset[str] = frozenset({
+    "peak_ndvi_std",
+    "peak_doy_mean",               # DOY 1-366
+    "peak_doy_std",
+    "integrated_ndvi_std",
+    "greenup_rate_mean",           # only appended when rate >= 0 by construction
+    "greenup_rate_std",
+    "season_length_mean",
+    "season_length_std",
+    "cv",                          # computed only when mean > 0
+    "interannual_peak_range",
+    "interannual_peak_std",
+    "n_peaks_mean",
+    "peak_separation_mean",
+    "relative_peak_amplitude_mean",
+    "valley_depth_mean",
+})
 
 # Grouped for sidebar display.
 METRIC_GROUPS: dict[str, list[str]] = {

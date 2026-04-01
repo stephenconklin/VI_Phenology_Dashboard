@@ -553,6 +553,7 @@ def compute_basemap_metric(
         z = da_c.std(dim="time").compute().values
     elif metric == "data_coverage":
         z = da_c.notnull().mean(dim="time").compute().values
+        z[z == 0.0] = np.nan  # pixels with no valid obs → transparent
     else:
         raise ValueError(f"Unknown on-the-fly basemap metric: {metric!r}")
 
@@ -586,7 +587,7 @@ def load_metrics_for_basemap(
     Independent per-axis coarsening factors preserve the native spatial
     density of each dimension.
     """
-    with xr.open_dataset(str(metrics_path), mask_and_scale=True) as ds_m:
+    with xr.open_dataset(str(metrics_path), mask_and_scale=True, decode_timedelta=False) as ds_m:
         if metric not in ds_m:
             raise KeyError(
                 f"Metric {metric!r} not found in {metrics_path}. "

@@ -150,7 +150,13 @@ def _worker_process_rows(
                     & (pixel_ts >= vi_min)
                     & (pixel_ts <= vi_max)
                 )
-                if int(valid.sum()) < min_valid:
+                n_valid = int(valid.sum())
+                # Always skip pixels with no valid observations — prevents
+                # Whittaker from producing spurious near-zero output for
+                # truly empty (nodata) pixels regardless of min_valid_obs.
+                if n_valid == 0:
+                    continue  # partial stays at fill_value
+                if n_valid < min_valid:
                     continue  # partial stays at fill_value
 
                 metrics = _extract_pixel_metrics(
