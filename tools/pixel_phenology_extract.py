@@ -74,10 +74,14 @@ try:
 except ImportError:
     _HAS_TQDM = False
 
+from pyproj import CRS as _CRS
+
 from config import (
     ALL_19_METRICS,
+    DATACUBE_CRS_EPSG,
     DEFAULT_VI_VAR,
     LAMBDA_DEFAULT,
+    METRIC_LABELS,
     PIXEL_METRIC_CONFIG,
     VI_VALID_RANGE,
 )
@@ -344,11 +348,34 @@ def _process_region(
             pbar.close()
 
     # ------------------------------------------------------------------
+    # Discover CRS WKT from the source datacube's spatial_ref variable.
+    # Falls back to DATACUBE_CRS_EPSG from config if not found.
+    # ------------------------------------------------------------------
+    _crs_wkt: str | None = None
+    try:
+        with nc4.Dataset(str(paths.nc_path), mode="r") as _src:
+            if "spatial_ref" in _src.variables:
+                _sr = _src["spatial_ref"]
+                _crs_wkt = (
+                    getattr(_sr, "crs_wkt", None)
+                    or getattr(_sr, "spatial_ref", None)
+                )
+    except Exception:
+        pass
+    if not _crs_wkt:
+        _crs_wkt = _CRS.from_epsg(DATACUBE_CRS_EPSG).to_wkt()
+
+    _crs_obj   = _CRS.from_wkt(_crs_wkt)
+    _cf_params = _crs_obj.to_cf()
+    _gm_name   = _cf_params.get("grid_mapping_name", "transverse_mercator")
+
+    # ------------------------------------------------------------------
     # Write output NetCDF4
     # ------------------------------------------------------------------
     print(f"  Writing {out_path.name} …")
     with nc4.Dataset(str(out_path), mode="w", format="NETCDF4") as out:
-        out.description = (
+        out.Conventions     = "CF-1.8"
+        out.description     = (
             f"Per-pixel phenological metrics — {region_id} "
             f"(VI={vi_var}, lambda={lam:.0f})"
         )
@@ -359,15 +386,32 @@ def _process_region(
         out.createDimension("y", ny)
         out.createDimension("x", nx)
 
-        yv           = out.createVariable("y", "f8", ("y",))
-        yv[:]        = y_vals
-        yv.units     = "m"
-        yv.long_name = "UTM northing"
+        yv               = out.createVariable("y", "f8", ("y",))
+        yv[:]            = y_vals
+        yv.units         = "m"
+        yv.long_name     = "UTM northing"
+        yv.standard_name = "projection_y_coordinate"
+        yv.axis          = "Y"
 
-        xv           = out.createVariable("x", "f8", ("x",))
-        xv[:]        = x_vals
-        xv.units     = "m"
-        xv.long_name = "UTM easting"
+        xv               = out.createVariable("x", "f8", ("x",))
+        xv[:]            = x_vals
+        xv.units         = "m"
+        xv.long_name     = "UTM easting"
+        xv.standard_name = "projection_x_coordinate"
+        xv.axis          = "X"
+
+        # CF-1.8 grid-mapping variable
+        sr                   = out.createVariable("spatial_ref", "i4", ())
+        sr[:]                = 0
+        sr.grid_mapping_name = _gm_name
+        sr.crs_wkt           = _crs_wkt
+        sr.spatial_ref       = _crs_wkt   # GDAL compatibility alias
+        for _attr, _val in _cf_params.items():
+            if _attr != "grid_mapping_name":
+                try:
+                    setattr(sr, _attr, _val)
+                except Exception:
+                    pass
 
         for m in ALL_19_METRICS:
             var = out.createVariable(
@@ -376,8 +420,12 @@ def _process_region(
                 zlib=True,
                 complevel=4,
             )
-            var[:]          = results[m]
-            var.long_name   = m.replace("_", " ")
+            var[:]           = results[m]
+            var.long_name    = m.replace("_", " ")
+            var.grid_mapping = "spatial_ref"
+            _, _unit_str = METRIC_LABELS.get(m, (m, ""))
+            if _unit_str:
+                var.units = _unit_str
 
     elapsed = time.time() - t0
     mins, secs = divmod(int(elapsed), 60)
