@@ -197,7 +197,7 @@ valid years.
 (VI units)
 
 $$
-\sigma_{\text{peak}} = \text{std}\!\left\{\max_{d \in y}\,\hat{z}_d\right\}_{y=1}^{N_y}
+\sigma_{\text{peak}} = \text{std}_{y=1}^{N_y}\!\left[\max_{d \in y}\,\hat{z}_d\right]
 $$
 
 A measure of year-to-year fluctuation in peak greenness.
