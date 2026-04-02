@@ -30,15 +30,12 @@ values represent pixel-level summaries of the 2016–2019 observation record.
 | Format | CF-1.8 NetCDF4 (HDF5 backend) |
 | Dimensions | `(time, y, x)` |
 | Spatial resolution | 30 m |
-| CRS | WGS 84 / UTM Zone 34S (EPSG:32734) |
+| CRS | Variable |
 | `y` coordinate | UTM northing (m), `float64` |
 | `x` coordinate | UTM easting (m), `float64` |
 | `time` coordinate | `int32`, "days since 1970-01-01" |
 | VI variable | One of NDVI, EVI2, NIRv — auto-detected from filename |
 | Fill value | Per-file `_FillValue` attribute; treated as NaN |
-
-Temporal coverage is January 2016 – June 2019 (approximately 3.5 years,
-irregular cadence of 1–3 days depending on cloud cover and quality masking).
 
 ### 2.2 Valid Observation Ranges
 
@@ -48,11 +45,8 @@ and excluded from all computations:
 | VI | Valid range |
 |---|---|
 | NDVI | −0.1 to 1.0 |
-| EVI2 | −1.0 to 2.0 |
-| NIRv | −0.5 to 1.0 |
-
-The practical effect is that cloud-contaminated retrievals, water surfaces,
-and deep shadow pixels are suppressed before any smoothing or metric extraction.
+<!--| EVI2 | −1.0 to 2.0 |
+| NIRv | −0.5 to 1.0 |-->
 
 ---
 
@@ -203,7 +197,7 @@ valid years.
 (VI units)
 
 $$
-\sigma_{\text{peak}} = \text{std}\left\{\max_{d \in y}\,\hat{z}_d\right\}_{y=1}^{N_y}
+\sigma_{\text{peak}} = \text{std}\!\left\{\max_{d \in y}\,\hat{z}_d\right\}_{y=1}^{N_y}
 $$
 
 A measure of year-to-year fluctuation in peak greenness.
